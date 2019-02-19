@@ -2,11 +2,13 @@ import numpy as np
 import scipy.stats
 from statsmodels.sandbox.stats.multicomp import multipletests
 import matplotlib.pyplot as plt
+import pandas as pd
 
 import calour as ca
+from calour.util import _to_list
 
 
-def equalize_groups(exp, group_field, equal_fields):
+def equalize_groups(exp, group_field, equal_fields, random_seed=None):
     '''Normalize an experiment so all groups have the same number of samples from each equal_field
 
     Parameters
@@ -29,18 +31,52 @@ def equalize_groups(exp, group_field, equal_fields):
             exp = exp.join_metadata_fields(jfield, cefield, cname)
             jfield = cname
             cname += 'X'
-        jfield = cname
     exp = exp.join_metadata_fields(group_field, jfield, '__calour_final_field')
-    allexp = []
+    samples = []
     for cval in exp.sample_metadata[jfield].unique():
         cexp = exp.filter_samples(jfield, cval)
-        cexp = cexp.downsample('__calour_final_field', inplace=True)
-        allexp.append(cexp)
-    res = allexp.pop()
-    if len(allexp) > 1:
-        for cexp in allexp:
-            res = res.join_experiments(cexp)
+        if len(cexp.sample_metadata['__calour_final_field'].unique()) == 1:
+            continue
+        cexp = cexp.downsample('__calour_final_field', inplace=True, random_state=random_seed)
+        samples.extend(cexp.sample_metadata.index.values)
+    res = exp.filter_ids(samples, axis='s')
     return res
+
+
+def merge_general(exp, field, val1, val2, new_field=None, v1_new=None, v2_new=None):
+    '''merge a field with multiple values into a new field with only two values
+    All samples with values not in val1, val2 are filtered away
+
+   Parameters
+   ----------
+    exp:
+        calour.Experiment
+    field : str
+        the field to merge
+    val1, val2: list of str
+        the values to merge together
+    new_field : str or None (optional)
+        name of the new field. if None, new field will be field+"_merged"
+    v1_new, v2_new: str or None, optional
+        name of new values for merged val1, val2
+        if None, will use "_".join(val1)
+
+    Returns
+    -------
+    newexp: calour.Experiment, with values in 2 categories - yes/no
+    '''
+    if new_field is None:
+        new_field = field + '_merged'
+    newexp = exp.copy()
+    newexp.sample_metadata[new_field] = newexp.sample_metadata[field].copy()
+    if v1_new is None:
+        v1_new = '+'.join(map(str, val1))
+    if v2_new is None:
+        v2_new = '+'.join(map(str, val2))
+    newexp.sample_metadata[new_field].replace(val1, v1_new, inplace=True)
+    newexp.sample_metadata[new_field].replace(val2, v2_new, inplace=True)
+    newexp = newexp.filter_samples(new_field, [v1_new, v2_new], inplace=True)
+    return newexp
 
 
 def get_ratios(exp, id_field, group_field, group1, group2, min_thresh=5):
@@ -136,7 +172,7 @@ def get_sign_pvals(exp, alpha=0.1, min_present=5):
 
 def show_wordcloud(exp, ignore_exp=None, server='http://127.0.0.1:5000'):
     '''open the wordcloud html page from dbbact for all sequences in exp
-    
+
     File is saved into 'wordcloud.html'
 
     Parameters
@@ -148,25 +184,25 @@ def show_wordcloud(exp, ignore_exp=None, server='http://127.0.0.1:5000'):
     import requests
     import webbrowser
     import os
-    
+
     print('getting wordcloud for %d sequences' % len(exp.feature_metadata))
-    params={}
-    params['sequences']=list(exp.feature_metadata.index.values)
-    params['ignore_exp']=ignore_exp
-    res=requests.post(server+'/sequences_wordcloud',json=params)
-    
-    if res.status_code!=200:
+    params = {}
+    params['sequences'] = list(exp.feature_metadata.index.values)
+    params['ignore_exp'] = ignore_exp
+    res = requests.post(server + '/sequences_wordcloud', json=params)
+
+    if res.status_code != 200:
         print('failed')
         print(res.status_code)
         print(res.reason)
 
     print('got output')
-    with open('wordcloud.html','w') as fl:
+    with open('wordcloud.html', 'w') as fl:
         fl.write(res.text)
-    webbrowser.open('file://'+os.path.realpath('wordcloud.html'), new=True)
+    webbrowser.open('file://' + os.path.realpath('wordcloud.html'), new=True)
 
 
-def collapse_correlated(exp,min_corr=0.95):
+def collapse_correlated(exp, min_corr=0.95):
     '''merge features that have very correlated expression profile
     useful after dbbact.sample_enrichment()
     all correlated featuresIDs are concatenated to a single id
@@ -177,8 +213,8 @@ def collapse_correlated(exp,min_corr=0.95):
     '''
     import numpy as np
     data = exp.get_data(sparse=False, copy=True)
-    corr = np.corrcoef(data,rowvar=False)
-    use_features=set(np.arange(corr.shape[0]))
+    corr = np.corrcoef(data, rowvar=False)
+    use_features = set(np.arange(corr.shape[0]))
     feature_ids = {}
     orig_ids = {}
     for idx, cfeature in enumerate(exp.feature_metadata.index.values):
@@ -189,9 +225,9 @@ def collapse_correlated(exp,min_corr=0.95):
     for idx in range(corr.shape[0]):
         if idx not in use_features:
             continue
-        corr_pos = np.where(corr[idx,:]>=min_corr)[0]
+        corr_pos = np.where(corr[idx, :] >= min_corr)[0]
         for idx2 in corr_pos:
-            if idx2==idx:
+            if idx2 == idx:
                 continue
             if idx2 in use_features:
                 id1 = orig_ids[idx]
@@ -202,7 +238,7 @@ def collapse_correlated(exp,min_corr=0.95):
                 else:
                     pos1 = idx
                     pos2 = idx2
-                feature_ids[pos1] = feature_ids[pos1]+'; '+feature_ids[pos2]
+                feature_ids[pos1] = feature_ids[pos1] + '; ' + feature_ids[pos2]
 #                 data[:, idx] = data[:, idx] + data[:, idx2]
                 use_features.remove(idx2)
                 del feature_ids[idx2]
@@ -218,7 +254,7 @@ def collapse_correlated(exp,min_corr=0.95):
 
 def plot_violin(exp, field, features=None, downsample=True, num_keep=None, **kwargs):
     '''Plot a violin plot for the distribution of frequencies for a (combined set) of features
-    
+
     Parameters
     ----------
     exp: Experiment
@@ -231,7 +267,7 @@ def plot_violin(exp, field, features=None, downsample=True, num_keep=None, **kwa
     num_keep: int or None, optional
         The minimal group size for downsample, or None to use smallest group size
     **kwargs: additional parameters to pass to pyplot.violinplot
-    
+
     Returns
     -------
     figure
@@ -239,41 +275,260 @@ def plot_violin(exp, field, features=None, downsample=True, num_keep=None, **kwa
     import matplotlib.pyplot as plt
 
     if downsample:
-        exp=exp.downsample(field, num_keep=num_keep)
+        exp = exp.downsample(field, num_keep=num_keep)
     if features is not None:
-        exp=exp.filter_ids(features)
+        exp = exp.filter_ids(features)
     data = exp.get_data(sparse=False).sum(axis=1)
     group_freqs = []
     group_names = []
     for cgroup in exp.sample_metadata[field].unique():
         group_names.append(cgroup)
-        group_freqs.append(data[exp.sample_metadata[field]==cgroup])
+        group_freqs.append(data[exp.sample_metadata[field] == cgroup])
     fig = plt.figure()
-    plt.violinplot(group_freqs,**kwargs)
-    plt.xticks(np.arange(1,len(group_names)+1),group_names)
+    plt.violinplot(group_freqs, **kwargs)
+    plt.xticks(np.arange(1, len(group_names) + 1), group_names)
     return fig
 
 
-def splot(exp,field,**kwargs):
+def splot(exp, field, **kwargs):
     '''
     Plot a sorted version of the experiment exp based on field
     '''
     tt = exp.sort_samples(field)
-    res = tt.plot(sample_field=field,gui='qt5',**kwargs)
+    res = tt.plot(sample_field=field, gui='qt5', **kwargs)
     return res
 
 
-def sort_by_bacteria(exp, seq, inplace=False):
+def sort_by_bacteria(exp, seq, inplace=True):
     import numpy as np
     '''sort samples according to the frequency of a given bacteria
-    the selected bacteria frequency field is named "bf" (in the sample_metadata)
     '''
-    spos=np.where(exp.feature_metadata.index.values==seq)[0][0]
-    bf=exp.get_data(sparse=False,copy=True)[:,spos].flatten()
+    spos = np.where(exp.feature_metadata.index.values == seq)[0][0]
+    bf = exp.get_data(sparse=False, copy=True)[:, spos].flatten()
     if inplace:
-        newexp=exp
+        newexp = exp
     else:
-        newexp=exp.copy()
-    newexp.sample_metadata['bf']=bf
-    newexp=newexp.sort_samples('bf')
+        newexp = exp.copy()
+    newexp.sample_metadata['bf'] = bf
+    newexp = newexp.sort_samples('bf')
     return newexp
+
+
+def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecified', 'Unknown']), use_fields=None, alpha=0.05):
+    '''Test for metadata enrichment over all metadata fields between the two groups
+
+    Parameters
+    ----------
+    exp: Experiment
+    field: str
+        the field to divide the samples
+    val1: str or list of str
+        first group values for field
+    val2: str or list of str or None, optional
+        second group values or None to select all not in group1
+    ignore_vals: set of str
+        the values in the metadata field to ignore
+    use_fields: list of str or None, optional
+        list of fields to test for enrichment on None to test all
+    alpha: float
+        the p-value cutoff
+
+
+    Returns
+    -------
+
+    '''
+    exp1 = exp.filter_samples(field, val1)
+    if val2 is None:
+        exp2 = exp.filter_samples(field, val1, negate=True)
+    else:
+        exp2 = exp.filter_samples(field, val2)
+    tot_samples = len(exp.sample_metadata)
+    s1 = len(exp1.sample_metadata)
+    s2 = len(exp2.sample_metadata)
+
+    if use_fields is None:
+        use_fields = exp.sample_metadata.columns
+
+    for ccol in use_fields:
+        for cval in exp.sample_metadata[ccol].unique():
+            if cval in ignore_vals:
+                continue
+            num1 = np.sum(exp1.sample_metadata[ccol] == cval)
+            num2 = np.sum(exp2.sample_metadata[ccol] == cval)
+            if num1 + num2 < 20:
+                continue
+            p0 = (num1 + num2) / tot_samples
+            pv1 = scipy.stats.binom_test(num1, s1, p0)
+            pv2 = scipy.stats.binom_test(num2, s2, p0)
+            if (pv1 < alpha):
+                print('column %s value %s enriched in group1. p0=%f, num1=%f/%f (e:%f) num2=%f/%f (e:%f). pval %f' % (ccol, cval, p0, num1, s1, s1 * p0, num2, s2, s2 * p0, pv1))
+            if (pv2 < alpha):
+                print('column %s value %s enriched in group2. p0=%f, num1=%f/%f (e:%f) num2=%f/%f (e:%f). pval %f' % (ccol, cval, p0, num1, s1, s1 * p0, num2, s2, s2 * p0, pv2))
+
+
+def filter_singletons(exp, field, min_number=2):
+    '''Filter away samples that have <min_number of similar values in field
+
+    Used to remove singleton twins from the twinsuk study
+    '''
+    counts = exp.sample_metadata[field].value_counts()
+    counts = counts[counts >= min_number]
+    newexp = exp.filter_samples(field, list(counts.index.values))
+    return newexp
+
+
+def numeric_to_categories(exp, field, new_field, values, inplace=True):
+    '''convert a continuous field to categories
+
+    Parameters
+    ----------
+    exp: calour.Experiment
+    field: str
+        the continuous field name
+    new_field: str
+        name of the new categoriezed field name
+    values: int or list of float
+        the bins to categorize by. each number is the lowest number for the bin. a new bin is created for <first number
+
+    Returns
+    calour.Experiment with new metadata field new_field
+    '''
+    if not inplace:
+        exp = exp.copy()
+    sm = exp.sample_metadata
+    exp.sample_metadata[new_field] = '>%s' % values[-1]
+    for cval in values[::-1]:
+        exp.sample_metadata.loc[sm[field] <= cval, new_field] = str(cval)
+    return exp
+
+
+def taxonomy_from_db(exp):
+    '''add taxonomy to each feature based on dbbact
+    '''
+    exp = exp.add_terms_to_features('dbbact')
+    if len(exp.exp_metadata['__dbbact_taxonomy']) == 0:
+        print('did not obtain taxonomy from add_terms_to_features')
+    exp.feature_metadata['taxonomy'] = 'na'
+    for ck, cv in exp.exp_metadata['__dbbact_taxonomy'].items():
+        exp.feature_metadata.loc[ck, 'taxonomy'] = cv
+    return exp
+
+
+def focus_features(exp, ids, inplace=False):
+    '''Reorder the bacteria so the focus ids are at the beginning (top)
+
+    Parameters
+    ----------
+    exp: calour.Experiments
+    ids: str or list of str
+        the feature ids to focus
+
+    Returns
+    -------
+    calour.Experiment
+        reordered
+    '''
+    ids = _to_list(ids)
+    pos = []
+    for cid in ids:
+        if cid in exp.feature_metadata.index:
+            pos.append(exp.feature_metadata.index.get_loc(cid))
+    neworder = np.arange(len(exp.feature_metadata))
+    neworder = np.delete(neworder, pos)
+    neworder = pos + list(neworder)
+    newexp = exp.reorder(neworder, axis='f', inplace=inplace)
+    return newexp
+
+
+def alpha_diversity_as_feature(exp):
+    data = exp.get_data(sparse=False, copy=True)
+    data[data < 1] = 1
+    entropy = []
+    for idx in range(np.shape(data)[0]):
+        entropy.append(np.sum(data[idx, :] * np.log2(data[idx, :])))
+    alpha_div = entropy
+    newexp = exp.copy()
+    newexp.sample_metadata['_alpha_div'] = alpha_div
+    # newexp.add_sample_metadata_as_features('_alpha_div')
+    return newexp
+
+
+def filter_16s(exp, seq='TACG', minreads=5000):
+    '''Filter an experiment keeping only samples containing enough sequences starting with seq
+    '''
+    # get the sequences starting with seq
+    okseqs = [x for x in exp.feature_metadata.index.values if x[:len(seq)] == seq]
+
+    # count how many reads from the okseqs
+    texp = exp.filter_ids(okseqs)
+    dat = texp.get_data(sparse=False)
+    numok = dat.sum(axis=1)
+
+    newexp = exp.reorder(numok >= minreads, axis='s')
+    return newexp
+
+
+def create_ko_feature_file(ko_file='ko00001.json', out_file='ko_feature_map.tsv'):
+    '''Create a feature metadata file for kegg ontologies for picrust2
+
+    Parameters
+    ----------
+    ko_file: str, optional
+        name of the kegg ontology json file to import.
+        get it from https://www.genome.jp/kegg-bin/get_htext?ko00001
+    out_file: str, optional
+        name of the feature mapping file to load into calour
+        it contains level and name fields.
+
+    NOTE: if term appears in several levels, it will just keep the first one.
+    '''
+    import json
+
+    with open(ko_file) as f:
+        tt = json.load(f)
+    found = set()
+    outf = open(out_file, 'w')
+    outf.write('ko\tname\tlevel1\tlevel2\tlevel3\n')
+    for c1 in tt['children']:
+        l1name = c1['name']
+        for c2 in c1['children']:
+            l2name = c2['name']
+            for c3 in c2['children']:
+                l3name = c3['name']
+                if 'children' in c3:
+                    for c4 in c3['children']:
+                        l4name = c4['name']
+                        zz = l4name.split()
+                        if zz[0] in found:
+                            print('duplicate id %s' % l4name)
+                            continue
+                        found.add(zz[0])
+                        outf.write(zz[0] + '\t')
+                        outf.write(' '.join(zz[1:]) + '\t')
+                        outf.write(l1name + '\t')
+                        outf.write(l2name + '\t')
+                        outf.write(l3name + '\n')
+                else:
+                    # print('no children for level3 %s' % c3)
+                    pass
+    print('saved to %s' % out_file)
+
+
+def add_taxonomy(exp):
+    '''Add DBBact derived taxonomy to sequences in the experiment
+    The taxonomy is added as exp.feature_metadata.taxonomy
+    NOTE: can erase the current taxonomy
+    NOTE: will also fill the exp_metadata dbbact fields
+
+    Parameters:
+    -----------
+    exp: calour.Experiment
+
+    Returns:
+    --------
+    exp: same as the input (modification is inplace)
+    '''
+    exp.add_terms_to_features('dbbact', get_taxonomy=True)
+    exp.feature_metadata['taxonomy'] = pd.Series(exp.exp_metadata['__dbbact_taxonomy'])
+    return exp
