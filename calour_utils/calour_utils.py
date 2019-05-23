@@ -3,7 +3,7 @@ from collections import defaultdict
 import numpy as np
 import scipy.stats
 from statsmodels.sandbox.stats.multicomp import multipletests
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 import pandas as pd
 
 import calour as ca
@@ -144,16 +144,16 @@ def get_sign_pvals(exp, alpha=0.1, min_present=5):
         nneg = np.sum(cdat < 0)
         if npos + nneg >= min_present:
             keep.append(idx)
-    print('keeping %d features with enough ratios' %len(keep))
-    exp = exp.reorder(keep,axis='f')
+    print('keeping %d features with enough ratios' % len(keep))
+    exp = exp.reorder(keep, axis='f')
     pvals = []
     esize = []
     for idx in range(exp.data.shape[1]):
         cdat = exp.data[:, idx]
         npos = np.sum(cdat > 0)
         nneg = np.sum(cdat < 0)
-        pvals.append(scipy.stats.binom_test(npos,npos+nneg))
-        esize.append((npos-nneg)/(npos+nneg))
+        pvals.append(scipy.stats.binom_test(npos, npos + nneg))
+        esize.append((npos - nneg) / (npos + nneg))
     # plt.figure()
     # sp = np.sort(pvals)
     # plt.plot(np.arange(len(sp)),sp)
@@ -162,8 +162,8 @@ def get_sign_pvals(exp, alpha=0.1, min_present=5):
     index = np.arange(len(reject))
     esize = np.array(esize)
     pvals = np.array(pvals)
-    exp.feature_metadata['esize']=esize
-    exp.feature_metadata['pval']=pvals
+    exp.feature_metadata['esize'] = esize
+    exp.feature_metadata['pval'] = pvals
     index = index[reject]
     okesize = esize[reject]
     new_order = np.argsort(okesize)
