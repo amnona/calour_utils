@@ -145,19 +145,19 @@ def get_sign_pvals(exp, alpha=0.1, min_present=5):
         if npos + nneg >= min_present:
             keep.append(idx)
     print('keeping %d features with enough ratios' %len(keep))
-    exp=exp.reorder(keep,axis='f')
+    exp = exp.reorder(keep,axis='f')
     pvals = []
     esize = []
     for idx in range(exp.data.shape[1]):
-        cdat = exp.data[:,idx]
-        npos = np.sum(cdat>0)
-        nneg = np.sum(cdat<0)
+        cdat = exp.data[:, idx]
+        npos = np.sum(cdat > 0)
+        nneg = np.sum(cdat < 0)
         pvals.append(scipy.stats.binom_test(npos,npos+nneg))
         esize.append((npos-nneg)/(npos+nneg))
-    plt.figure()
-    sp = np.sort(pvals)
-    plt.plot(np.arange(len(sp)),sp)
-    plt.plot([0,len(sp)],[0,1],'k')
+    # plt.figure()
+    # sp = np.sort(pvals)
+    # plt.plot(np.arange(len(sp)),sp)
+    # plt.plot([0,len(sp)],[0,1],'k')
     reject = multipletests(pvals, alpha=alpha, method='fdr_bh')[0]
     index = np.arange(len(reject))
     esize = np.array(esize)
