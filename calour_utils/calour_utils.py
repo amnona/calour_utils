@@ -408,7 +408,7 @@ def numeric_to_categories(exp, field, new_field, values, inplace=True):
 def taxonomy_from_db(exp):
     '''add taxonomy to each feature based on dbbact
     '''
-    exp = exp.add_terms_to_features('dbbact')
+    exp = exp.add_terms_to_features('dbbact', get_taxonomy=True)
     if len(exp.exp_metadata['__dbbact_taxonomy']) == 0:
         print('did not obtain taxonomy from add_terms_to_features')
     exp.feature_metadata['taxonomy'] = 'na'
@@ -689,3 +689,138 @@ def filename_from_zip(tempdir, data_file, internal_data):
         raise ValueError('No biom table in qza file %s. is it a qiime2 feature table?' % data_file)
     data_file = fl.extract(internal_name, tempdir)
     return data_file
+
+
+def genetic_distance(data, labels):
+    '''calculate the std within each family
+    used by get_genetic for testing bacteria significantly associated with family
+    '''
+    distances = np.zeros(np.shape(data)[0])
+    for cidx in np.unique(labels):
+        pos = np.where(labels == cidx)[0]
+        if len(pos) > 1:
+            distances -= np.std(data[:, pos], axis=1) / np.mean(data[:, pos], axis=1)
+            # distances -= np.std(data[:, pos], axis=1)
+    return distances
+
+
+def get_genetic(exp, field, alpha=0.1, numperm=1000, fdr_method='dsfdr'):
+    '''Look for features that depend on family/genetics by comparing within family std/mean to random permutations
+
+    Parameters
+    ----------
+    field: str
+        the field that has the same value for members of same family
+    '''
+    cexp = exp.filter_abundance(0, strict=True)
+    data = cexp.get_data(copy=True, sparse=False).transpose()
+    data[data < 4] = 4
+    labels = exp.sample_metadata[field].values
+
+    # remove samples that don't have similar samples w.r.t field
+    remove_samps = []
+    remove_pos = []
+    for cidx, cval in enumerate(np.unique(labels)):
+        pos = np.where(labels == cval)[0]
+        if len(pos) < 2:
+            remove_samps.append(cval)
+            remove_pos.append(cidx)
+    if len(remove_pos) > 0:
+        labels = np.delete(labels, remove_pos)
+        data = np.delete(data, remove_pos, axis=1)
+        print('removed singleton samples %s' % remove_samps)
+
+    print('testing with %d samples' % len(labels))
+    keep, odif, pvals = ca.dsfdr.dsfdr(data, labels, method=genetic_distance, transform_type='log2data', alpha=alpha, numperm=numperm, fdr_method=fdr_method)
+    print('Positive correlated features : %d. Negative correlated features : %d. total %d'
+          % (np.sum(odif[keep] > 0), np.sum(odif[keep] < 0), np.sum(keep)))
+    newexp = ca.analysis._new_experiment_from_pvals(cexp, exp, keep, odif, pvals)
+    return newexp
+    # return keep, odif, pvals
+
+
+def filter_contam(exp, field, blank_vals, negate=False):
+    '''Filter suspected contaminants based on blank samples
+
+    Filter by removing features that have lower mean in samples compared to blanks
+
+    Parameters
+    ----------
+    exp: calour.AmpliconExperiment
+    field: str
+        name of the field identifying blank samples
+    blank_vals: str or list of str
+        the values for the blank samples in the field
+    negate: bool, optional
+        False (default) to remove contaminants, True to keep only contaminants
+
+    Returns
+    -------
+    calour.AmpliconExperiment with only features that are not contaminants (if negate=False) or contaminants (if negate=True)
+    '''
+    bdata = exp.filter_samples(field, blank_vals).get_data(sparse=False)
+    sdata = exp.filter_samples(field, blank_vals, negate=True).get_data(sparse=False)
+    bmean = bdata.mean(axis=0)
+    smean = sdata.mean(axis=0)
+    okf = smean > bmean
+    print('found %d contaminants' % okf.sum())
+    if negate:
+        okf = (okf == False)
+    newexp = exp.reorder(okf, axis='f')
+    return newexp
+
+
+def order_samples(exp, field, order):
+    '''Order samples according to a custom order in field. non-specified values in order are maintained as is
+
+    Parameters
+    ----------
+    exp: Calour.Experiment
+    field: str
+        name of the field to order by
+    order: list of str
+        the requested order of values in the field
+
+    Returns
+    -------
+    Calour.Experiment
+    '''
+    newexp = exp.copy()
+    newexp.sample_metadata['__order_field'] = 999999
+    for idx, cval in enumerate(order):
+        newexp.sample_metadata.loc[newexp.sample_metadata[field] == cval, '__order_field'] = idx
+    newexp = newexp.sort_samples('__order_field')
+    return newexp
+
+
+def test_picrust_enrichment(dd_exp, picrust_exp, **kwargs):
+    '''find enrichment in picrust2 terms comparing 2 groups
+
+    Parameters
+    ----------
+    dd_exp: calour.AmpliconExperiment
+        the differential abundance results (on bacteria)
+    picrust_exp: calour.Experiment
+        The picrust2 intermediate file (EC/KO). load it using:
+        picrust_exp=ca.read('./EC_predicted.tsv',data_file_type='csv',sample_in_row=True, data_table_sep='\t', normalize=None)
+        NOTE: rows are KO/EC, columns are bacteria
+    **kwargs:
+        passed to diff_abundance. can include: alpha, method, etc.
+
+    Returns
+    -------
+    ca.Experiment with the enriched KO/EC terms
+        The original group the bacteria (column) is in the '__group' field
+    '''
+    vals = dd_exp.feature_metadata['_calour_direction'].unique()
+    if len(vals) != 2:
+        raise ValueError('Diff abundance groups contain !=2 values')
+    id1=dd_exp.feature_metadata[dd_exp.feature_metadata['_calour_direction']==vals[0]]
+    id2=dd_exp.feature_metadata[dd_exp.feature_metadata['_calour_direction']==vals[1]]
+    picrust_exp.sample_metadata['__picrust_test']=''
+    picrust_exp.sample_metadata.loc[picrust_exp.sample_metadata.index.isin(id1.index),'__group']=vals[0]
+    picrust_exp.sample_metadata.loc[picrust_exp.sample_metadata.index.isin(id2.index),'__group']=vals[1]
+    tt = picrust_exp.filter_samples('__group',[vals[0], vals[1]])
+    tt = tt.diff_abundance('__group', vals[0], vals[1], **kwargs)
+    tt.sample_metadata = tt.sample_metadata.merge(dd_exp.feature_metadata, how='left', left_on='_sample_id', right_on='_feature_id')
+    return tt
