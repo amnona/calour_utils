@@ -1,13 +1,40 @@
 from collections import defaultdict
+from logging import getLogger, NOTSET, basicConfig
+from pkg_resources import resource_filename
+from logging.config import fileConfig
 
 import numpy as np
 import scipy.stats
 from statsmodels.sandbox.stats.multicomp import multipletests
 # import matplotlib.pyplot as plt
 import pandas as pd
+import sklearn
+import sklearn.ensemble
 
 import calour as ca
 from calour.util import _to_list
+from calour.training import plot_scatter, plot_roc, plot_cm
+
+try:
+    # get the logger config file location
+    log_file = resource_filename(__package__, 'log.cfg')
+    # log = path.join(path.dirname(path.abspath(__file__)), 'log.cfg')
+    # set the logger output according to log.cfg
+    # setting False allows other logger to print log.
+    fileConfig(log_file, disable_existing_loggers=False)
+except:
+    print('failed to load logging config file')
+    basicConfig(format='%(levelname)s:%(message)s')
+
+logger = getLogger(__package__)
+# set the log level to the same as calour module if present
+try:
+    clog = getLogger('calour')
+    calour_log_level = clog.getEffectiveLevel()
+    if calour_log_level != NOTSET:
+        logger.setLevel(calour_log_level)
+except:
+    print('calour module not found for log level setting. Level not set')
 
 
 def equalize_groups(exp, group_field, equal_fields, random_seed=None):
@@ -167,6 +194,7 @@ def get_sign_pvals(exp, alpha=0.1, min_present=5):
     index = index[reject]
     okesize = esize[reject]
     new_order = np.argsort(okesize)
+    new_order = np.argsort((1 - pvals[reject]) * np.sign(okesize))
     newexp = exp.reorder(index[new_order], axis='f', inplace=False)
     print('found %d significant' % len(newexp.feature_metadata))
     return newexp
@@ -824,3 +852,318 @@ def test_picrust_enrichment(dd_exp, picrust_exp, **kwargs):
     tt = tt.diff_abundance('__group', vals[0], vals[1], **kwargs)
     tt.sample_metadata = tt.sample_metadata.merge(dd_exp.feature_metadata, how='left', left_on='_sample_id', right_on='_feature_id')
     return tt
+
+
+def uncorrelate(exp, normalize=False, random_seed=None):
+    '''remove correlations between features in the experiment, by permuting samples of each bacteria
+
+    Parameters
+    ----------
+    exp: calour.Experiment
+        the experiment to permute
+    normalize: False or int, optional
+        if not int, normalize each sample after the uncorrelation to normalize reads
+    random_seed: int or None, optional
+        if not None, seed the numpy random seed with it
+
+    Returns
+    -------
+    calour.Experiment
+        the permuted experiment (each feature randomly permuted along samples)
+    '''
+    exp = exp.copy()
+    exp.sparse = False
+    if random_seed is not None:
+        np.random_seed(random_seed)
+    for idx in range(len(exp.feature_metadata)):
+        exp.data[:, idx] = np.random.permutation(exp.data[:, idx])
+    if normalize:
+        exp.normalize(10000, inplace=True)
+    return exp
+
+
+def plot_dbbact_terms(exp, region=None, only_exact=False, collapse_per_exp=True, ignore_exp=None, num_terms=50, ignore_terms=[]):
+    from sklearn.cluster import AffinityPropagation, OPTICS
+    from sklearn import metrics
+    import matplotlib.pyplot as plt
+
+    logger.debug('plot_dbbact_terms for %d features' % len(exp.feature_metadata))
+
+    ignore_terms = set(ignore_terms)
+    exp = exp.add_terms_to_features('dbbact')
+    terms_per_seq = {}
+    all_terms = defaultdict(float)
+    sequences = exp.feature_metadata.index.values
+    # sequences=sequences[:20]
+    for cseq in sequences:
+        anno = exp.exp_metadata['__dbbact_sequence_annotations'][cseq]
+        expterms = {}
+        for idx, cannoid in enumerate(anno):
+            canno = exp.exp_metadata['__dbbact_annotations'][cannoid]
+            # test if region is the same if we require exact region
+            if only_exact:
+                if region != canno['primer']:
+                    continue
+            if ignore_exp is not None:
+                if canno['expid'] in ignore_exp:
+                    continue
+            # get the experiment from where the annotation comes
+            # if we don't collapse by experiment, each annotation gets a fake unique expid
+            if collapse_per_exp:
+                cexp = canno['expid']
+            else:
+                cexp = idx
+
+            if canno['annotationtype'] == 'contamination':
+                canno['details'].append(('all', 'contamination'))
+            for cdet in canno['details']:
+                cterm = cdet[1]
+                if cterm in ignore_terms:
+                    continue
+                if cdet[0] in ['low']:
+                    cterm = '-' + cterm
+                if cexp not in expterms:
+                    expterms[cexp] = defaultdict(float)
+                expterms[cexp][cterm] += 1
+        cseq_terms = defaultdict(float)
+        for cexp, cterms in expterms.items():
+            for cterm in cterms.keys():
+                cseq_terms[cterm] += 1
+        for cterm, ccount in cseq_terms.items():
+            all_terms[cterm] += ccount
+        terms_per_seq[cseq] = cseq_terms
+
+    all_terms_sorted = sorted(all_terms, key=all_terms.get, reverse=True)
+
+    use_terms = all_terms_sorted[:num_terms]
+    use_terms_set = set(use_terms)
+
+    # +1 since we have 'other'
+    outmat = np.zeros([len(use_terms) + 1, len(sequences)])
+    for seqidx, cseq in enumerate(sequences):
+        for cterm in all_terms.keys():
+            if cterm in use_terms_set:
+                idx = use_terms.index(cterm)
+            else:
+                idx = len(use_terms)
+            outmat[idx, seqidx] += terms_per_seq[cseq][cterm]
+
+    term_names = use_terms + ['other']
+    texp = ca.AmpliconExperiment(outmat, pd.DataFrame(term_names, columns=['term'], index=term_names), pd.DataFrame(sequences, columns=['_feature_id'], index=sequences))
+    texp.sample_metadata['_sample_id'] = texp.sample_metadata['term']
+    ww = texp.normalize()
+
+    print('clustering')
+    af = AffinityPropagation().fit(ww.get_data(sparse=False))
+    cluster_centers_indices = af.cluster_centers_indices_
+    print('found %d clusters' % len(cluster_centers_indices))
+    cluster_centers_indices = af.cluster_centers_indices_
+    labels = af.labels_
+
+    texp.sample_metadata['cluster'] = labels
+    www = texp.aggregate_by_metadata('cluster')
+
+    # now cluster the features
+    bb = OPTICS(metric='l1')
+    scaled_exp = www.scale(axis='f')
+    fitres = bb.fit(scaled_exp.get_data(sparse=False).T)
+    bbb = fitres.labels_
+    www.feature_metadata['cluster'] = bbb
+    www2 = www.aggregate_by_metadata('cluster', axis='f')
+
+    # and plot the pie charts
+    # prepare the labels
+    ll = www.sample_metadata['_calour_merge_ids'].values
+    labels = []
+    for clabel in ll:
+        clabel = clabel.split(';')
+        clabel = clabel[:4]
+        clabel = ';'.join(clabel)
+        labels.append(clabel)
+
+    plt.figure()
+    sqplots = np.ceil(np.sqrt(len(www2.feature_metadata)))
+    for idx, cid in enumerate(www2.feature_metadata.index.values):
+        plt.subplot(sqplots, sqplots, idx + 1)
+        ttt = www2.filter_ids([cid])
+        num_features = len(ttt.feature_metadata['_calour_merge_ids'].values[0].split(';'))
+        tttdat = ttt.get_data(sparse=False).T[0, :]
+        if np.sum(tttdat) > 0:
+            tttdat = tttdat / np.sum(tttdat)
+        plt.pie(tttdat, radius=1,counterclock=False)
+        plt.title(num_features)
+    plt.figure()
+    plt.pie(ttt.get_data(sparse=False).T[0,:], radius=1)
+    plt.legend(labels)
+
+    # # merge the original terms used in each cluster
+    # details = []
+    # for cmerge_ids in www.sample_metadata['_calour_merge_ids'].values:
+    #     cdetails = ''
+    #     cmids = cmerge_ids.split(';')
+    #     for cmid in cmids:
+    #         cdetails += ww.sample_metadata['term'][int(cmid)] + ', '
+    #     details.append(cdetails)
+    # www.sample_metadata['orig_terms'] = details
+
+    # www = www.cluster_features()
+
+    # www.plot(gui='qt5', xticks_max=None, sample_field='term')
+    return www
+
+    # ww=ww.cluster_data(axis=1,transform=ca.transforming.binarize)
+    # ww=ww.cluster_data(axis=0,transform=ca.transforming.binarize)
+    # ww.plot(gui='qt5', xticks_max=None,sample_field='term')
+    # return texp
+
+
+def trim_seqs(exp, new_len):
+    '''trim sequences in the Experiment to length new_len, joining sequences identical on the short length
+
+    Parameters
+    ----------
+    exp: calour.AmpliconExperiment
+        the experiment to trim the sequences (features)
+    new_len: the new read length per sequence
+
+    Returns
+    -------
+    new_exp: calour.AmpliconExperiment
+        with trimmed sequences
+    '''
+    new_seqs = [cseq[:new_len] for cseq in exp.feature_metadata.index.values]
+    new_exp = exp.copy()
+    new_exp.feature_metadata['new_seq'] = new_seqs
+    new_exp = new_exp.aggregate_by_metadata('new_seq', axis='f', agg='sum')
+    new_exp.feature_metadata = new_exp.feature_metadata.reindex(new_exp.feature_metadata['new_seq'])
+    new_exp.feature_metadata['_feature_id'] = new_exp.feature_metadata['new_seq']
+    return new_exp
+
+
+def filter_features_exp(exp, ids_exp, insert=True):
+    '''Filter features in Experiment exp based on experiment ids_exp.
+    If insert==True, also insert blank features if feature in ids_exp does not exist in exp
+
+    Parameters
+    ----------
+    exp: calour.Experiment
+        the experiment to filter
+    ids_exp: calour.Experiment
+        the experiment used to get the ids to filter by
+    insert: bool, optional
+        True to also insert blank features if feature from ids_exp does not exist in exp
+
+    Returns
+    -------
+    newexp: calour.Experiment
+        exp, filtered and ordered according to ids_exp'''
+    if insert:
+        texp = exp.join_experiments(ids_exp)
+    else:
+        texp = exp.copy()
+    texp = texp.filter_ids(ids_exp.feature_metadata.index)
+    texp = texp.filter_samples('experiments', exp.description)
+    texp.description = exp.description
+    drop_cols = [x for x in texp.sample_metadata.columns if x not in exp.sample_metadata.columns]
+    texp.sample_metadata.drop(drop_cols, axis='columns', inplace=True)
+
+    return texp
+
+
+def regress_fit(exp, field, estimator=sklearn.ensemble.RandomForestRegressor(), params=None):
+    '''fit a regressor model to an experiment
+    Parameters
+    ----------
+    field : str
+        column name in the sample metadata, which contains the variable we want to fit
+    estimator : estimator object implementing `fit` and `predict`
+        scikit-learn estimator. e.g. :class:`sklearn.ensemble.RandomForestRegressor`
+    params: dict of parameters to supply to the estimator
+
+    Returns
+    -------
+    model: the model fit to the data
+    '''
+    X = exp.get_data(sparse=False)
+    y = exp.sample_metadata[field]
+
+    if params is None:
+        # use sklearn default param values for the given estimator
+        params = {}
+
+    # deep copy the model by clone to avoid the impact from last iteration of fit.
+    model = sklearn.base.clone(estimator)
+    model = model.set_params(**params)
+    model.fit(X, y)
+    return model
+
+
+def regress_predict(exp, field, model):
+    pred = model.predict(exp.data)
+    df = pd.DataFrame({'Y_PRED': pred, 'Y_TRUE': exp.sample_metadata[field].values, 'SAMPLE': exp.sample_metadata[field].index.values, 'CV': 0})
+    plot_scatter(df, cv=False)
+    return df
+
+
+def classify_fit(exp, field, estimator=sklearn.ensemble.RandomForestClassifier()):
+    '''fit a classifier model to the experiment
+
+    Parameters
+    ----------
+    exp: calour.Experiment
+        the experiment to classify
+    field: str
+        the field to classify
+    estimator : estimator object implementing `fit` and `predict`
+        scikit-learn estimator. e.g. :class:`sklearn.ensemble.RandomForestRegressor`
+
+    Returns
+    -------
+    model: the model fit to the data
+    '''
+    X = exp.get_data(sparse=False)
+    y = exp.sample_metadata[field]
+
+    # deep copy the model by clone to avoid the impact from last iteration of fit.
+    model = sklearn.base.clone(estimator)
+    model.fit(X, y)
+    return model
+
+
+def classify_predict(exp, field, model, predict='predict_proba', plot_it=True):
+    # pred = model.predict(exp.get_data(sparse=False))
+    X = exp.get_data(sparse=False)
+    y = exp.sample_metadata[field]
+    pred = getattr(model, predict)(X)
+    if pred.ndim > 1:
+        df = pd.DataFrame(pred, columns=model.classes_)
+    else:
+        df = pd.DataFrame(pred, columns=['Y_PRED'])
+    df['Y_TRUE'] = y.values
+    df['SAMPLE'] = y.index.values
+    # df = pd.DataFrame({'Y_PRED': pred, 'Y_TRUE': exp.sample_metadata[field].values, 'SAMPLE': exp.sample_metadata[field].index.values, 'CV': 0})
+    if plot_it:
+        ca.training.plot_roc(df, cv=False)
+        ca.training.plot_cm(df)
+    return df
+
+
+def classify_get_roc(result):
+    '''Get the ROC for the given prediction
+    '''
+    from sklearn.metrics import precision_recall_curve, average_precision_score, roc_curve, auc, confusion_matrix
+
+    classes = np.unique(result['Y_TRUE'].values)
+    classes.sort()
+
+    for cls in classes:
+        y_true = result['Y_TRUE'].values == cls
+        fpr, tpr, thresholds = roc_curve(y_true.astype(int), result[cls])
+        if np.isnan(fpr[-1]) or np.isnan(tpr[-1]):
+            logger.warning(
+                'The class %r is skipped because the true positive rate or '
+                'false positive rate computation failed. This is likely because you '
+                'have either no true positive or no negative samples for this class' % cls)
+        roc_auc = auc(fpr, tpr)
+
+    return roc_auc
