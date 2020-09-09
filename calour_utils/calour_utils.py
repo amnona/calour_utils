@@ -60,13 +60,13 @@ def equalize_groups(exp, group_field, equal_fields, random_seed=None):
             exp = exp.join_metadata_fields(jfield, cefield, cname)
             jfield = cname
             cname += 'X'
-    exp = exp.join_metadata_fields(group_field, jfield, '__calour_final_field')
+    exp = exp.join_metadata_fields(group_field, jfield, '__calour_final_field', axis=0)
     samples = []
     for cval in exp.sample_metadata[jfield].unique():
         cexp = exp.filter_samples(jfield, cval)
         if len(cexp.sample_metadata['__calour_final_field'].unique()) == 1:
             continue
-        cexp = cexp.downsample('__calour_final_field', inplace=True, random_state=random_seed)
+        cexp = cexp.downsample('__calour_final_field', inplace=True, random_seed=random_seed)
         samples.extend(cexp.sample_metadata.index.values)
     res = exp.filter_ids(samples, axis='s')
     return res
@@ -424,12 +424,23 @@ def numeric_to_categories(exp, field, new_field, values, inplace=True):
     Returns
     calour.Experiment with new metadata field new_field
     '''
+    tmp_field = '_calour_' + field + '_num'
+    values = np.sort(values)[::-1]
     if not inplace:
         exp = exp.copy()
+    # keep only numeric values (all other are 0)
+    exp.sample_metadata[tmp_field] = pd.to_numeric(exp.sample_metadata[field], errors='coerce')
+    exp.sample_metadata[tmp_field] = exp.sample_metadata[tmp_field].fillna(0)
+    new_field_num = new_field + '_num'
     sm = exp.sample_metadata
-    exp.sample_metadata[new_field] = '>%s' % values[-1]
-    for cval in values[::-1]:
-        exp.sample_metadata.loc[sm[field] <= cval, new_field] = str(cval)
+    exp.sample_metadata[new_field] = '>%s' % values[0]
+    exp.sample_metadata[new_field_num] = values[0]
+    for idx, cval in enumerate(values):
+        if idx < len(values) - 1:
+            exp.sample_metadata.loc[sm[tmp_field] <= cval, new_field] = '%s-%s' % (values[idx + 1], cval)
+        else:
+            exp.sample_metadata.loc[sm[tmp_field] <= cval, new_field] = '<%s' % (values[idx])
+        exp.sample_metadata.loc[sm[tmp_field] <= cval, new_field_num] = cval
     return exp
 
 
@@ -563,7 +574,7 @@ def add_taxonomy(exp):
     exp: same as the input (modification is inplace)
     '''
     exp.add_terms_to_features('dbbact', get_taxonomy=True)
-    exp.feature_metadata['taxonomy'] = pd.Series(exp.exp_metadata['__dbbact_taxonomy'])
+    exp.feature_metadata['taxonomy'] = pd.Series(exp.databases['dbbact']['taxonomy'])
     return exp
 
 
@@ -793,7 +804,7 @@ def filter_contam(exp, field, blank_vals, negate=False):
     okf = smean > bmean
     print('found %d contaminants' % okf.sum())
     if negate:
-        okf = (okf == False)
+        okf = (okf is False)
     newexp = exp.reorder(okf, axis='f')
     return newexp
 
@@ -843,12 +854,12 @@ def test_picrust_enrichment(dd_exp, picrust_exp, **kwargs):
     vals = dd_exp.feature_metadata['_calour_direction'].unique()
     if len(vals) != 2:
         raise ValueError('Diff abundance groups contain !=2 values')
-    id1=dd_exp.feature_metadata[dd_exp.feature_metadata['_calour_direction']==vals[0]]
-    id2=dd_exp.feature_metadata[dd_exp.feature_metadata['_calour_direction']==vals[1]]
-    picrust_exp.sample_metadata['__picrust_test']=''
-    picrust_exp.sample_metadata.loc[picrust_exp.sample_metadata.index.isin(id1.index),'__group']=vals[0]
-    picrust_exp.sample_metadata.loc[picrust_exp.sample_metadata.index.isin(id2.index),'__group']=vals[1]
-    tt = picrust_exp.filter_samples('__group',[vals[0], vals[1]])
+    id1 = dd_exp.feature_metadata[dd_exp.feature_metadata['_calour_direction'] == vals[0]]
+    id2 = dd_exp.feature_metadata[dd_exp.feature_metadata['_calour_direction'] == vals[1]]
+    picrust_exp.sample_metadata['__picrust_test'] = ''
+    picrust_exp.sample_metadata.loc[picrust_exp.sample_metadata.index.isin(id1.index), '__group'] = vals[0]
+    picrust_exp.sample_metadata.loc[picrust_exp.sample_metadata.index.isin(id2.index), '__group'] = vals[1]
+    tt = picrust_exp.filter_samples('__group', [vals[0], vals[1]])
     tt = tt.diff_abundance('__group', vals[0], vals[1], **kwargs)
     tt.sample_metadata = tt.sample_metadata.merge(dd_exp.feature_metadata, how='left', left_on='_sample_id', right_on='_feature_id')
     return tt
@@ -1058,15 +1069,14 @@ def filter_features_exp(exp, ids_exp, insert=True):
     newexp: calour.Experiment
         exp, filtered and ordered according to ids_exp'''
     if insert:
-        texp = exp.join_experiments(ids_exp)
+        texp = exp.join_experiments(ids_exp, field='orig_exp')
     else:
         texp = exp.copy()
     texp = texp.filter_ids(ids_exp.feature_metadata.index)
-    texp = texp.filter_samples('experiments', exp.description)
+    texp = texp.filter_samples('orig_exp', 'exp')
     texp.description = exp.description
     drop_cols = [x for x in texp.sample_metadata.columns if x not in exp.sample_metadata.columns]
     texp.sample_metadata.drop(drop_cols, axis='columns', inplace=True)
-
     return texp
 
 
@@ -1135,23 +1145,42 @@ def classify_predict(exp, field, model, predict='predict_proba', plot_it=True):
     X = exp.get_data(sparse=False)
     y = exp.sample_metadata[field]
     pred = getattr(model, predict)(X)
+    # print(pred)
+    # print(pred.ndim)
+    # print(model.classes_)
+    # numbad = 0
+    # totsamp = 0
+    # for i in range(len(pred)):
+    #     if y.values[i] == 'HC':
+    #         print(pred[i])
+    #         print(y.values[i])
+    #         print('---')
+    #         numbad += pred[i][0]
+    #         totsamp += 1
+    # print(numbad)
+    # print(totsamp)
+    # print(pred)
     if pred.ndim > 1:
         df = pd.DataFrame(pred, columns=model.classes_)
     else:
         df = pd.DataFrame(pred, columns=['Y_PRED'])
     df['Y_TRUE'] = y.values
+    df['CV'] = 1
     df['SAMPLE'] = y.index.values
     # df = pd.DataFrame({'Y_PRED': pred, 'Y_TRUE': exp.sample_metadata[field].values, 'SAMPLE': exp.sample_metadata[field].index.values, 'CV': 0})
     if plot_it:
         ca.training.plot_roc(df, cv=False)
+        ca.training.plot_prc(df)
         ca.training.plot_cm(df)
+    roc_auc = classify_get_roc(df)
+    print(roc_auc)
     return df
 
 
 def classify_get_roc(result):
     '''Get the ROC for the given prediction
     '''
-    from sklearn.metrics import precision_recall_curve, average_precision_score, roc_curve, auc, confusion_matrix
+    from sklearn.metrics import precision_recall_curve, average_precision_score, roc_curve, auc, confusion_matrix, roc_auc_score
 
     classes = np.unique(result['Y_TRUE'].values)
     classes.sort()
@@ -1167,3 +1196,31 @@ def classify_get_roc(result):
         roc_auc = auc(fpr, tpr)
 
     return roc_auc
+
+
+def equalize_sample_groups(exp, field):
+    '''Filter samples, so equal number of samples with each value in field remain.
+
+    Parameters
+    ----------
+    exp: calour.Experiment
+        the experiment to equalize
+    field: str
+        the field to equalize by
+
+    Returns
+    -------
+    newexp: calour.Experiment
+        with similar number of samples for each field value
+    '''
+    num_keep = exp.sample_metadata[field].value_counts().min()
+    logger.info('keeping %d samples with each value' % num_keep)
+    vals = exp.sample_metadata[field].values
+    num_val = defaultdict(int)
+    keep = []
+    for idx, cval in enumerate(vals):
+        if num_val[cval] < num_keep:
+            num_val[cval] += 1
+            keep.append(idx)
+    newexp = exp.reorder(keep, axis='s')
+    return newexp
