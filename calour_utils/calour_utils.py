@@ -1141,7 +1141,26 @@ def classify_fit(exp, field, estimator=sklearn.ensemble.RandomForestClassifier()
 
 
 def classify_predict(exp, field, model, predict='predict_proba', plot_it=True):
-    # pred = model.predict(exp.get_data(sparse=False))
+    '''predict classes on an experiment based on a model from calour_util.classify_fit()
+
+    Parameters
+    ----------
+    exp: calour.Experiment
+    field: str
+        Name of the field containing the categories to predict
+    model: sklearn.base
+        an sklean classifier trained on the fit data. Usually from calour_util.classify_fit()
+    predict: str, optional
+        the field to use from the model
+    plot_it: bool, optional
+        True to plot various metrics for the fitted classifier (ROC etc.)
+        False to skip plotting
+
+    Returns
+    -------
+    pandas.Dataframe
+
+    '''
     X = exp.get_data(sparse=False)
     y = exp.sample_metadata[field]
     pred = getattr(model, predict)(X)
@@ -1173,7 +1192,7 @@ def classify_predict(exp, field, model, predict='predict_proba', plot_it=True):
         ca.training.plot_prc(df)
         ca.training.plot_cm(df)
     roc_auc = classify_get_roc(df)
-    print(roc_auc)
+    # print('ROC is %f' % roc_auc)
     return df
 
 
