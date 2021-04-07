@@ -6,7 +6,7 @@ from logging.config import fileConfig
 import numpy as np
 import scipy.stats
 from statsmodels.sandbox.stats.multicomp import multipletests
-# import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 import pandas as pd
 import sklearn
 import sklearn.ensemble
@@ -57,10 +57,10 @@ def equalize_groups(exp, group_field, equal_fields, random_seed=None):
     if len(equal_fields) > 1:
         cname = '__calour_joined'
         for cefield in equal_fields[1:]:
-            exp = exp.join_metadata_fields(jfield, cefield, cname)
+            exp = exp.join_metadata_fields(jfield, cefield, cname, axis='s')
             jfield = cname
             cname += 'X'
-    exp = exp.join_metadata_fields(group_field, jfield, '__calour_final_field', axis=0)
+    exp = exp.join_metadata_fields(group_field, jfield, '__calour_final_field', axis='s')
     samples = []
     for cval in exp.sample_metadata[jfield].unique():
         cexp = exp.filter_samples(jfield, cval)
@@ -161,6 +161,20 @@ def get_sign_pvals(exp, alpha=0.1, min_present=5):
     '''get p-values for a sign-test with the data in exp
     data should come from get_ratios()
     does fdr on it
+
+    Parameters
+    ----------
+    exp: calour.Experiment
+        An experiment that contains reatios values in the data(e.g. the result of calour_utils.get_ratios() )
+    alpha: float, optional
+        the FDR threshold for the features to keep
+    min_present: int, optional
+        ony look at features present in at least min_present samples
+
+    Returns
+    -------
+    calour.Experiment with features significantly higher/lower (i.e. log ratios >0/<0) that expected by chance
+    feature_metadata will include esize and pval fields
     '''
     exp = exp.copy()
     # get rid of bacteria that don't have enough non-zero ratios
@@ -185,12 +199,15 @@ def get_sign_pvals(exp, alpha=0.1, min_present=5):
     # sp = np.sort(pvals)
     # plt.plot(np.arange(len(sp)),sp)
     # plt.plot([0,len(sp)],[0,1],'k')
-    reject = multipletests(pvals, alpha=alpha, method='fdr_bh')[0]
+    res = multipletests(pvals, alpha=alpha, method='fdr_bh')
+    reject = res[0]
+    qvals = res[1]
     index = np.arange(len(reject))
     esize = np.array(esize)
     pvals = np.array(pvals)
     exp.feature_metadata['esize'] = esize
     exp.feature_metadata['pval'] = pvals
+    exp.feature_metadata['qval'] = qvals
     index = index[reject]
     okesize = esize[reject]
     new_order = np.argsort(okesize)
@@ -770,10 +787,10 @@ def get_genetic(exp, field, alpha=0.1, numperm=1000, fdr_method='dsfdr'):
         print('removed singleton samples %s' % remove_samps)
 
     print('testing with %d samples' % len(labels))
-    keep, odif, pvals = ca.dsfdr.dsfdr(data, labels, method=genetic_distance, transform_type='log2data', alpha=alpha, numperm=numperm, fdr_method=fdr_method)
+    keep, odif, pvals, qvals = ca.dsfdr.dsfdr(data, labels, method=genetic_distance, transform_type='log2data', alpha=alpha, numperm=numperm, fdr_method=fdr_method)
     print('Positive correlated features : %d. Negative correlated features : %d. total %d'
           % (np.sum(odif[keep] > 0), np.sum(odif[keep] < 0), np.sum(keep)))
-    newexp = ca.analysis._new_experiment_from_pvals(cexp, exp, keep, odif, pvals)
+    newexp = ca.analysis._new_experiment_from_pvals(cexp, exp, keep, odif, pvals, qvals)
     return newexp
     # return keep, odif, pvals
 
@@ -1158,27 +1175,16 @@ def classify_predict(exp, field, model, predict='predict_proba', plot_it=True):
 
     Returns
     -------
-    pandas.Dataframe
+    pandas.Dataframe with the following fields:
+    'Y_TRUE': the real value of the samples
+    'CV':
+    'SAMPLE' the sample id (also the index)
+    all-field values: the probability of the sample being this value
 
     '''
     X = exp.get_data(sparse=False)
     y = exp.sample_metadata[field]
     pred = getattr(model, predict)(X)
-    # print(pred)
-    # print(pred.ndim)
-    # print(model.classes_)
-    # numbad = 0
-    # totsamp = 0
-    # for i in range(len(pred)):
-    #     if y.values[i] == 'HC':
-    #         print(pred[i])
-    #         print(y.values[i])
-    #         print('---')
-    #         numbad += pred[i][0]
-    #         totsamp += 1
-    # print(numbad)
-    # print(totsamp)
-    # print(pred)
     if pred.ndim > 1:
         df = pd.DataFrame(pred, columns=model.classes_)
     else:
@@ -1191,30 +1197,56 @@ def classify_predict(exp, field, model, predict='predict_proba', plot_it=True):
         ca.training.plot_roc(df, cv=False)
         ca.training.plot_prc(df)
         ca.training.plot_cm(df)
-    roc_auc = classify_get_roc(df)
+    # roc_auc = classify_get_roc(df)
     # print('ROC is %f' % roc_auc)
     return df
 
 
 def classify_get_roc(result):
     '''Get the ROC for the given prediction
+    NOTE: currently implemented only for 2 classes
     '''
-    from sklearn.metrics import precision_recall_curve, average_precision_score, roc_curve, auc, confusion_matrix, roc_auc_score
+    from sklearn.metrics import roc_auc_score
 
     classes = np.unique(result['Y_TRUE'].values)
-    classes.sort()
+    if len(classes) > 2:
+        raise ValueError('More than 2 values for real values. cannot calculate ROC (need to update the function....)')
 
-    for cls in classes:
-        y_true = result['Y_TRUE'].values == cls
-        fpr, tpr, thresholds = roc_curve(y_true.astype(int), result[cls])
-        if np.isnan(fpr[-1]) or np.isnan(tpr[-1]):
-            logger.warning(
-                'The class %r is skipped because the true positive rate or '
-                'false positive rate computation failed. This is likely because you '
-                'have either no true positive or no negative samples for this class' % cls)
-        roc_auc = auc(fpr, tpr)
-
+    roc_auc = roc_auc_score(result['Y_TRUE'].values == classes[0], result[classes[0]])
     return roc_auc
+    # for cls in classes:
+    #     y_true = result['Y_TRUE'].values == cls
+    #     fpr, tpr, thresholds = roc_curve(y_true.astype(int), result[cls])
+    #     if np.isnan(fpr[-1]) or np.isnan(tpr[-1]):
+    #         logger.warning(
+    #             'The class %r is skipped because the true positive rate or '
+    #             'false positive rate computation failed. This is likely because you '
+    #             'have either no true positive or no negative samples for this class' % cls)
+    #     roc_auc2 = auc(fpr, tpr)
+    #     roc_auc = roc_auc_score(y_true.astype(int), result[cls])
+    #     if roc_auc2 != roc_auc:
+    #         raise ValueError('roc_auc %f != self calculated roc %f' % (roc_auc, roc_auc2))
+    #     # print(accuracy_score(y_true.astype(int), result[cls]))
+    #     # print(balanced_accuracy_score(y_true.astype(int), result[cls]))
+    #     print(roc_auc)
+
+
+def classify_get_accuracy(result, threshold=0.5):
+    '''Get the accuracy for the given prediction
+    NOTE: currently implemented only for 2 classes
+    Parameters
+    '''
+    from sklearn.metrics import accuracy_score, balanced_accuracy_score
+    classes = np.unique(result['Y_TRUE'].values)
+    if len(classes) > 2:
+        raise ValueError('More than 2 values for real values. cannot calculate accuracy (need to update the function....)')
+    classes.sort()
+    result['predicted_class'] = classes[1]
+    result.loc[result[classes[0]] >= threshold, 'predicted_class'] = classes[0]
+
+    # ascore = accuracy_score(result['Y_TRUE'] == classes[0], result[classes[0]] >= threshold)
+    ascore = balanced_accuracy_score(result['Y_TRUE'], result['predicted_class'])
+    return ascore
 
 
 def equalize_sample_groups(exp, field):
@@ -1243,3 +1275,100 @@ def equalize_sample_groups(exp, field):
             keep.append(idx)
     newexp = exp.reorder(keep, axis='s')
     return newexp
+
+
+def _paired_diff(data, shuffle_pairs):
+    '''Calculate the sample2-sample1 diff over all samples'''
+    pass
+
+
+def paired_test(exp, pair_field, order_field, ):
+    '''Perform a paired test for pairs of samples
+
+    Parameters
+    ----------
+    exp: calour.Experiment
+    pair_field: str
+        Name of the sample field by which samples are paired (2 samples with each value)
+        NOTE: values with != 2 samples will be dropped
+
+    Returns
+    -------
+    '''
+    # keep only pairs
+    drop_values = []
+    for cval, cexp in exp.iterate(pair_field):
+        if len(cexp.sample_metadata) != 2:
+            logger.info('Value %s has %d samples' % (cval, len(cexp.sample_metadata)))
+            drop_values.append(cval)
+    if len(drop_values) > 0:
+        logger.warning('Dropping %d values with != 2 samples' % len(drop_values))
+        exp = exp.filter_samples(pair_field, drop_values, negate=True)
+
+    # prepare the shuffle pairs
+    shuffle_pairs = []
+    for cval in exp.sample_metadata[pair_field].unique():
+        shuffle_pairs.append(np.where(exp.sample_metadata[pair_field].values == cval))
+    return exp, shuffle_pairs
+
+
+def plot_taxonomy(exp, field='taxonomy', num_show=10, show_legend=True, normalize=False):
+    '''Plot a taxonomy bar plot (can also be used for terms)
+
+    Parameters
+    ----------
+    exp: ca.Experiment
+    field: str, optional
+        name of the feature field to use for the bars (i.e. 'taxonomy' or 'term')
+    num_show: int, optional
+        number of taxa to show
+    show_legend: bool, optional
+        True to plot the legend, False to not plot
+    '''
+    f = plt.figure()
+    if normalize:
+        exp = exp.normalize(axis='s')
+    exp = exp.sort_abundance()
+    e1 = exp.reorder(np.arange(-1, -(num_show + 1), -1), axis='f')
+    exp = e1
+    term_num = []
+    terms = exp.feature_metadata.index.values
+    data = exp.get_data(sparse=False)
+    for cid in range(len(exp.feature_metadata)):
+        term_num.append(data[:, cid])
+    cbottom = np.zeros(len(term_num[0]))
+    for cid in range(len(term_num)):
+        ctn = term_num[cid]
+        plt.bar(np.arange(len(ctn)), ctn, bottom=cbottom)
+        cbottom += ctn
+    if show_legend:
+        plt.legend(terms)
+    return f
+
+
+def cluster_by_terms(exp, min_score_threshold=0.1, filter_ratio=1.01):
+    '''Cluster the experiment features by dbbact terms associated with them
+
+    Parameters
+    ----------
+    exp: calour.AmpliconExperiment
+    min_score_threshold: float, optional
+        the minimum term score to keep (anything lower will be changed to it)
+    filter_ratio: float, optional
+        throw away all features (after applying min_score) with mean > filter_ratio * min_score
+
+    Returns:
+    --------
+    exp: calour.AmpliconExperiment
+        with features clustered by dbbact terms
+    '''
+    # create an experiment of terms (as features) X features (as samples)
+    db = db = ca.database._get_database_class('dbbact')
+    logger.info('getting per-feature terms for %d terms' % len(exp.feature_metadata))
+    texp = db.sample_term_scores(exp, term_type='fscore', axis='f')
+    texp.data[texp.data < min_score_threshold] = min_score_threshold
+    texp = texp.filter_by_data('abundance', axis='s', cutoff=min_score_threshold * filter_ratio)
+    logger.info('after filtering terms with < %f score threshold, %d remaining' % (min_score_threshold, len(texp.sample_metadata)))
+    texp = texp.cluster_data(axis='s', metric='canberra')
+    new_exp = exp.filter_ids(texp.sample_metadata.index)
+    return new_exp
