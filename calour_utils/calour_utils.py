@@ -465,10 +465,10 @@ def taxonomy_from_db(exp):
     '''add taxonomy to each feature based on dbbact
     '''
     exp = exp.add_terms_to_features('dbbact', get_taxonomy=True)
-    if len(exp.exp_metadata['__dbbact_taxonomy']) == 0:
+    if len(exp.databases['dbbact']['taxonomy']) == 0:
         print('did not obtain taxonomy from add_terms_to_features')
     exp.feature_metadata['taxonomy'] = 'na'
-    for ck, cv in exp.exp_metadata['__dbbact_taxonomy'].items():
+    for ck, cv in exp.databases['dbbact']['taxonomy'].items():
         exp.feature_metadata.loc[ck, 'taxonomy'] = cv
     return exp
 
