@@ -981,10 +981,10 @@ def plot_dbbact_terms(exp, region=None, only_exact=False, collapse_per_exp=True,
     texp.sample_metadata['_sample_id'] = texp.sample_metadata['term']
     ww = texp.normalize()
 
-    print('clustering')
+    logger.info('clustering')
     af = AffinityPropagation().fit(ww.get_data(sparse=False))
     cluster_centers_indices = af.cluster_centers_indices_
-    print('found %d clusters' % len(cluster_centers_indices))
+    logger.info('found %d clusters' % len(cluster_centers_indices))
     cluster_centers_indices = af.cluster_centers_indices_
     labels = af.labels_
 
