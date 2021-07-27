@@ -13,7 +13,7 @@ import sklearn.ensemble
 
 import calour as ca
 from calour.util import _to_list
-from calour.training import plot_scatter, plot_roc, plot_cm
+from calour.training import plot_scatter
 
 try:
     # get the logger config file location
