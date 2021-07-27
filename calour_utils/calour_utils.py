@@ -1278,7 +1278,9 @@ def equalize_sample_groups(exp, field):
 
 
 def _paired_diff(data, shuffle_pairs):
-    '''Calculate the sample2-sample1 diff over all samples'''
+    '''Calculate the sample2-sample1 diff over all samples
+
+    NOT IMPLEMENTED'''
     pass
 
 
