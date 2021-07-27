@@ -151,7 +151,7 @@ def get_ratios(exp, id_field, group_field, group1, group2, min_thresh=5):
         cdat2[cdat2 < min_thresh] = min_thresh
         newexp.data[pos1, :] = np.log2(cdat1 / cdat2)
         keep.append(pos1[0])
-    print('found %d ratios' % len(keep))
+    logger.info('found %d ratios' % len(keep))
 #     print(keep)
     newexp = newexp.reorder(keep, axis='s')
     return newexp
