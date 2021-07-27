@@ -140,10 +140,10 @@ def get_ratios(exp, id_field, group_field, group1, group2, min_thresh=5):
         pos1 = np.where((exp.sample_metadata[id_field] == cid) & (exp.sample_metadata[group_field] == group1))[0]
         pos2 = np.where((exp.sample_metadata[id_field] == cid) & (exp.sample_metadata[group_field] == group2))[0]
         if len(pos1) != 1:
-            print('not 1 sample for group1: %s' % cid)
+            logger.info('not 1 sample for group1: %s' % cid)
             continue
         if len(pos2) != 1:
-            print('not 1 sample for group2: %s' % cid)
+            logger.info('not 1 sample for group2: %s' % cid)
             continue
         cdat1 = data[pos1, :]
         cdat2 = data[pos2, :]
