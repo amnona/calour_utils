@@ -1676,10 +1676,10 @@ def health_index(exp, method=None):
     # load the non-specific bacteria
     data_dir = resource_filename(__package__, 'data')
     # nsd = pd.read_csv('~/git/calour_utils/calour_utils/nonspecific-down_feature.txt', sep='\t', index_col=0)
-    nsd = pd.read_csv(os.path.join(data_dir, '/nonspecific-down_feature.txt'), sep='\t', index_col=0)
+    nsd = pd.read_csv(os.path.join(data_dir, 'nonspecific-down_feature.txt'), sep='\t', index_col=0)
     nsd['dir'] = 'down'
     # nsu = pd.read_csv('~/git/calour_utils/calour_utils/nonspecific-up_feature.txt', sep='\t', index_col=0)
-    nsu = pd.read_csv(os.path.join(data_dir, '/nonspecific-up_feature.txt'), sep='\t', index_col=0)
+    nsu = pd.read_csv(os.path.join(data_dir, 'nonspecific-up_feature.txt'), sep='\t', index_col=0)
     nsu['dir'] = 'up'
     nsf = nsd.merge(nsu, how='outer')
 
