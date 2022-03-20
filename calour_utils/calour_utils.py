@@ -2,6 +2,7 @@ from collections import defaultdict
 from logging import getLogger, NOTSET, basicConfig
 from pkg_resources import resource_filename
 from logging.config import fileConfig
+import os
 
 import numpy as np
 import scipy.stats
@@ -10,6 +11,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import sklearn
 import sklearn.ensemble
+
+from IPython.display import display
 
 import calour as ca
 from calour.util import _to_list
@@ -325,6 +328,8 @@ def plot_violin(exp, field, features=None, downsample=True, num_keep=None, **kwa
         exp = exp.downsample(field, num_keep=num_keep)
     if features is not None:
         exp = exp.filter_ids(features)
+        if len(exp.feature_metadata) == 0:
+            raise ValueError('No features remaining after filtering. did you supply a correct list?')
     data = exp.get_data(sparse=False).sum(axis=1)
     group_freqs = []
     group_names = []
@@ -1045,21 +1050,27 @@ def plot_dbbact_terms(exp, region=None, only_exact=False, collapse_per_exp=True,
     # return texp
 
 
-def trim_seqs(exp, new_len):
+def trim_seqs(exp, new_len, pos='end'):
     '''trim sequences in the Experiment to length new_len, joining sequences identical on the short length
 
     Parameters
     ----------
     exp: calour.AmpliconExperiment
         the experiment to trim the sequences (features)
-    new_len: the new read length per sequence
+    new_len: the new read length per sequence (if pos=='end' or length to trim (if pos=='start'))
+    pos: str, optional
+        'end' to trim from end of sequence
+        'start' to trim from start of sequence
 
     Returns
     -------
     new_exp: calour.AmpliconExperiment
         with trimmed sequences
     '''
-    new_seqs = [cseq[:new_len] for cseq in exp.feature_metadata.index.values]
+    if pos == 'end':
+        new_seqs = [cseq[:new_len] for cseq in exp.feature_metadata.index.values]
+    elif pos == 'start':
+        new_seqs = [cseq[new_len:] for cseq in exp.feature_metadata.index.values]
     new_exp = exp.copy()
     new_exp.feature_metadata['new_seq'] = new_seqs
     new_exp = new_exp.aggregate_by_metadata('new_seq', axis='f', agg='sum')
@@ -1374,3 +1385,326 @@ def cluster_by_terms(exp, min_score_threshold=0.1, filter_ratio=1.01):
     texp = texp.cluster_data(axis='s', metric='canberra')
     new_exp = exp.filter_ids(texp.sample_metadata.index)
     return new_exp
+
+
+def plot_diff_term_tree(exp, term, relation='both', keep_only_diff=True, simplify=True, colormap='coolwarm'):
+    '''Plot a cytoscape tree of a given term and it's parents/children
+    NOTE: requires ipycytoscape
+
+    Parameters
+    ----------
+    exp: ca.AmpliconExperiment
+        result of the plot_diff_abundance_enrichment(). Run it with: term_type='parentterm', alpha=1, add_single_exp_warning=False .
+
+    term: str
+        The term to plot the tree for (i.e. excreta)
+
+    Returns
+    -------
+    graph: ipycytoscape.CytoscapeWidget() representation of the graph
+    '''
+    import ipycytoscape
+    import networkx as nx
+
+    # get the parent/child terms graph
+    db = ca.database._get_database_class('dbbact')
+    family = db.db.get_term_family_graph([term], relation=relation)
+    g = nx.node_link_graph(family)
+
+    # add size/color and pval/odif to graph
+    cm = plt.get_cmap(colormap)
+    qq = exp.feature_metadata.copy()
+    qq.index = qq.index.str.lower()
+    for cnode in g.nodes:
+        if 'name' not in g.nodes[cnode]:
+            print(g.nodes[cnode])
+            g.nodes[cnode]['name'] = str(cnode)
+            continue
+        cname = g.nodes[cnode]['name']
+        if cname in qq.index:
+            g.nodes[cnode]['pval'] = qq.loc[cname]['pvals']
+            g.nodes[cnode]['odif'] = qq.loc[cname]['odif']
+            if qq.loc[cname]['odif'] > 0:
+                    pvcol = 0.5
+            else:
+                    pvcol = -0.5
+            ccolor = ((1 - qq.loc[cname]['pvals']) * pvcol + 0.5)
+            g.nodes[cnode]['color'] = list(np.array(cm(ccolor * 255)) * 255)[:3]
+            g.nodes[cnode]['size'] = np.max([np.abs(qq.loc[cname]['odif']) * 500, 1])
+
+    # delete term nodes without odif field filter (so we won't get a huge forest)
+    if keep_only_diff:
+        while True:
+            done = True
+            for cnode in g:
+                if 'odif' in g.nodes[cnode]:
+                    continue
+                if len(g.out_edges(cnode)) > 0:
+                    for cin in g.in_edges(cnode):
+                        g.add_edge(list(cin)[0], list(g.out_edges(cnode))[0][1])
+                g.remove_node(cnode)
+                done = False
+                break
+            if done:
+                break
+
+    # simplify the graph, removing terms that have 1 parent, 1 child
+    if simplify:
+        done = False
+        while not done:
+            done = True
+            for cnode in g.nodes():
+                if len(g.in_edges(cnode)) != 1:
+                    continue
+                if len(g.out_edges(cnode)) != 1:
+                    continue
+                g.add_edge(list(g.in_edges(cnode))[0][0], list(g.out_edges(cnode))[0][1])
+                g.remove_node(cnode)
+                done = False
+                break
+
+    # plot the graph
+    directed = ipycytoscape.CytoscapeWidget()
+    directed.graph.add_graph_from_networkx(g)
+    directed.set_style([{'selector': 'node',
+                         'css': {'content': 'data(name)',
+                                 'text-valign': 'center',
+                                 'color': 'white',
+                                 'text-outline-width': 2,
+                                 'text-outline-color': 'green',
+                                 'background-color': 'data(color)',
+                                 'width': 'data(size)',
+                                 'height': 'data(size)'}
+                         },
+                        {'selector': 'edge',
+                         'style': {'width': 4,
+                                   'line-color': '#9dbaea',
+                                   'target-arrow-shape': 'triangle',
+                                   'target-arrow-color': '#9dbaea',
+                                   'curve-style': 'bezier'}},
+                        {'selector': ':selected',
+                         'css': {'background-color': 'black',
+                                 'line-color': 'black',
+                                 'target-arrow-color': 'black',
+                                 'source-arrow-color': 'black',
+                                 'text-outline-color': 'black'}}
+                        ])
+    directed.set_layout(name='dagre')
+    directed.set_tooltip_source('name')
+    display(directed)
+    return directed
+
+
+def bicluster_enrichment(exp, min_prevalence=0.05, std_thresh=None, transform='none', max_iterations=20, subset=None, random_seed=None, alpha=0.1):
+    '''Do unsupervised bi-clustering, and test the resulting cluster for feature (via dbBact) and sample (via all the metadata fields) enrichment
+
+    Parameters
+    ----------
+    exp: calour.AmpliconExperiment
+    min_prevalence: float or None, optional
+        the minimal prevalence for features to keep for the clustering (for filter_prevalence()) before the biclustering
+        if None, do not do filter_prevalence()
+    std_thresh: float or None, optional
+        if not None, the mean/std threshold to keep in the cluster
+        if None, randomize a threshold before the run
+    transform: str, optional
+        the transform on the data before the buclustering. options:
+            'binarydata': transform to presence/absence
+            'rankdata': rank each feature on the samples
+            'log2data': log2 pf the data. numbers<1 are changed to 1
+            'none': no transform
+    max_iterations: int, optional
+        the number of feature/sample iterations to perform
+    subset: int or list if int or None, optional
+        the number of samples to include in the initial seed samples for the algorithm.
+        if list of int, these are the sample positions (in the sample_metadata dataframe) to use as the initial samples
+        If None, randomly select a part of the number of samples to use (uniform)
+    random_seed: int or None, optional
+        if not none, set the numpy random seed prior to running the clustering
+    alpha: float, optional
+        the alpha dsFDR threshold for the sample metadata enrichment
+
+    Returns
+    -------
+    exp: calour.AmpliconExperiment
+        after the prevalence filtering, and ordered according to the cluster. Cluster info is in the field: '_bicluster' (both for sample_metadata and feature_metadata)
+    e: calour.AmpliconExperiment
+        The enriched dbBact terms for the features (from plot_diff_abundance_enrichment)
+        Negative value in the feature_metadata._calour_stat (or '1.0' in the _calour_dir) are enriched in the cluster, positive values (or '0.0' in _calour_dir) are enriched in samples not in the cluster
+    dd: calour.AmpliconExperiment:
+        The enriched metadata terms. Features are FIELD_:_VALUE, Samples are the original samples
+        Negative value in the feature_metadata._calour_stat (or '1.0' in the _calour_dir) are enriched in the cluster, positive values (or '0.0' in _calour_dir) are enriched in samples not in the cluster
+    '''
+    if random_seed is not None:
+        np.random.seed(random_seed)
+    exp = exp.copy()
+    if min_prevalence is not None:
+        exp = exp.filter_prevalence(min_prevalence)
+    data = exp.get_data(sparse=False, copy=True)
+    if transform == 'binarydata':
+        data = (data > 0)
+    elif transform == 'rankdata':
+        data = scipy.stats.rankdata(data, axis=0)
+    elif transform == 'log2data':
+        data[data < 1] = 1
+        data = np.log2(data)
+    elif transform == 'none':
+        pass
+    else:
+        raise ValueError('transform %s not supported' % transform)
+
+    data_norm_per_feature = sklearn.preprocessing.scale(data, axis=0)
+    data_norm_per_sample = sklearn.preprocessing.scale(data, axis=1)
+
+    num_samples = len(exp.sample_metadata)
+    num_features = len(exp.feature_metadata)
+
+    if subset is None:
+        subset = int(num_samples * np.random.rand())
+        print('initial number of samples: %d' % subset)
+    if isinstance(subset, list) or isinstance(subset, tuple) or isinstance(subset, np.ndarray):
+        samples = subset
+    else:
+        samples = np.random.permutation(np.arange(num_samples))
+        samples = samples[:subset]
+    features = np.arange(num_features)
+
+    if std_thresh is None:
+        std_thresh = np.abs(np.random.rand())
+        print('std threshold:', std_thresh)
+
+    for citer in range(max_iterations):
+        for caxis, cdim in zip(['s', 'f'], [0, 1]):
+            if caxis == 's':
+                cdata = data_norm_per_feature
+                mask = np.ones([num_samples], dtype=bool)
+                mask[samples] = False
+                cg = cdata[samples, :]
+                cng = cdata[mask, :]
+            else:
+                cdata = data_norm_per_sample
+                mask = np.ones([num_features], dtype=bool)
+                mask[features] = False
+                cg = cdata[:, features]
+                cng = cdata[:, mask]
+            # get the std on the other dimension (i.e. for each feature if we are looking on the samples)
+            cstd = np.std(cdata, axis=cdim)
+            mean_in = np.mean(cg, axis=cdim)
+            mean_out = np.mean(cng, axis=cdim)
+            diff = (mean_in - mean_out) / cstd
+            ok = np.where(diff > std_thresh)[0]
+            if caxis == 's':
+                features = ok
+                remaining = 'features'
+            else:
+                samples = ok
+                remaining = 'samples'
+#             print(remaining, len(ok))
+    print('samples: %d, features: %d' % (len(samples), len(features)))
+    if len(samples) == 0 or len(features) == 0:
+        print('clustering failed. try again with a lower std_thresh ')
+        return None, None, None
+
+    mask = np.zeros([num_samples])
+    mask[samples] = 1
+    exp.sample_metadata['_bicluster'] = mask
+    exp.sample_metadata['_bicluster'] = exp.sample_metadata['_bicluster'].astype(str)
+    mask = np.zeros([num_features])
+    mask[features] = 1
+    exp.feature_metadata['_bicluster'] = mask
+    exp.feature_metadata['_bicluster'] = exp.feature_metadata['_bicluster'].astype(str)
+    not_samples = np.delete(np.arange(num_samples), samples)
+    not_features = np.delete(np.arange(num_features), features)
+    exp = exp.reorder(np.hstack([samples, not_samples]), axis='s')
+    exp = exp.reorder(np.hstack([features, not_features]), axis='f')
+
+    exp.plot(gui='cli', barx_fields=['_bicluster'], bary_fields=['_bicluster'])
+
+    print('*** features')
+    dd = exp.diff_abundance('_bicluster', '0.0', '1.0', alpha=1)
+    f, e = dd.plot_diff_abundance_enrichment()
+#     print(e.feature_metadata.to_html())
+    display(e.feature_metadata)
+
+    # metadata enrichment
+    mddat = np.zeros([0, num_samples])
+    field_vals = []
+    for cfield in exp.sample_metadata.columns:
+        cunique = exp.sample_metadata[cfield].unique()
+        num_unique = len(cunique)
+        if num_unique == 1:
+            continue
+        if num_unique > np.max([num_samples / 10, 3]):
+            try:
+                cdata = exp.sample_metadata[cfield].astype(float)
+                mddat = np.vstack([mddat, np.array(cdata)])
+                field_vals.append('%s_:_continuous' % (cfield))
+                continue
+            except:
+                continue
+        for cval in cunique:
+            field_vals.append('%s_:_%s' % (cfield, cval))
+            cdata = (exp.sample_metadata[cfield] == cval).astype(bool)
+            mddat = np.vstack([mddat, np.array(cdata)])
+
+    mdexp = ca.Experiment(mddat.T, exp.sample_metadata, pd.DataFrame(field_vals, columns=['_feature_id'], index=field_vals))
+    dd = mdexp.diff_abundance('_bicluster', '0.0', '1.0', alpha=alpha)
+    print('*** samples')
+#     print(dd.feature_metadata.to_html())
+    display(dd.feature_metadata)
+    return exp, e, dd
+
+
+def health_index(exp, method=None):
+    '''Calcuulate the per-sample health index (from "Meta-analysis defines predominant shared microbial responses in various diseases and a specific inflammatory bowel disease signal", https://doi.org/10.1186/s13059-022-02637-7)
+
+    Parameters
+    ----------
+    exp: ca.AmpliconExperiment
+        the experiment to calculate the per-sample health index for.
+        NOTE: must be V4 region
+    method: str or None, optional
+        the method to normalize the experiment prior to calculating the health index
+        options are:
+            None: no transform (the freq method for health index)
+            'binarydata': do presence/absence based health index
+            'rankdata': transform each feature to rank (across all samples)
+
+    Returns
+    -------
+    '''
+    # load the non-specific bacteria
+    data_dir = resource_filename(__package__, 'data')
+    # nsd = pd.read_csv('~/git/calour_utils/calour_utils/nonspecific-down_feature.txt', sep='\t', index_col=0)
+    nsd = pd.read_csv(os.path.join(data_dir, '/nonspecific-down_feature.txt'), sep='\t', index_col=0)
+    nsd['dir'] = 'down'
+    # nsu = pd.read_csv('~/git/calour_utils/calour_utils/nonspecific-up_feature.txt', sep='\t', index_col=0)
+    nsu = pd.read_csv(os.path.join(data_dir, '/nonspecific-up_feature.txt'), sep='\t', index_col=0)
+    nsu['dir'] = 'up'
+    nsf = nsd.merge(nsu, how='outer')
+
+    newexp = exp.copy()
+    newexp = newexp.filter_ids(nsf._feature_id.values)
+    newexp.sparse = False
+
+    if method is None:
+        pass
+    elif method == 'binarydata':
+        newexp.data = (newexp.data > 0)
+    elif method == 'rankdata':
+        newexp.data = scipy.stats.rankdata(newexp.data, axis=0)
+    else:
+        raise ValueError('method %s not supported' % method)
+
+    upf = nsf[nsf['dir'] == 'up']['_feature_id'].values
+    downf = nsf[nsf['dir'] == 'down']['_feature_id'].values
+
+    upexp = newexp.filter_ids(upf)
+    nup = upexp.data.sum(axis=1)
+    downexp = newexp.filter_ids(downf)
+    ndown = downexp.data.sum(axis=1)
+    # we do "-" so high is healthy
+    dbi = - np.log2((nup + 0.1) / (ndown + 0.1))
+    exp = exp.copy()
+    exp.sample_metadata['_health_index'] = dbi
+    return exp

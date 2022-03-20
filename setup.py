@@ -59,6 +59,7 @@ setup(name='calour_utils',
       url='https://github.com/amnona/calour_utils',
       test_suite='nose.collector',
       packages=find_packages(),
+      package_data={'calour_utils': ['data/*.txt']},
       python_requires='>=3.6',
       install_requires=[
           'numpy',
