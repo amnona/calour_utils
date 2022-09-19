@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from logging import getLogger, NOTSET, basicConfig
 from pkg_resources import resource_filename
 from logging.config import fileConfig
@@ -8,6 +8,8 @@ import numpy as np
 import scipy.stats
 from statsmodels.sandbox.stats.multicomp import multipletests
 import matplotlib.pyplot as plt
+import matplotlib.lines
+import matplotlib as mpl
 import pandas as pd
 import sklearn
 import sklearn.ensemble
@@ -56,6 +58,10 @@ def equalize_groups(exp, group_field, equal_fields, random_seed=None):
         Experiment, with equal number of samples for each value of equal_fields in each group
     '''
     exp = exp.copy()
+
+    if isinstance(equal_fields, str):
+        equal_fields = [equal_fields]
+
     jfield = equal_fields[0]
     if len(equal_fields) > 1:
         cname = '__calour_joined'
@@ -64,9 +70,13 @@ def equalize_groups(exp, group_field, equal_fields, random_seed=None):
             jfield = cname
             cname += 'X'
     exp = exp.join_metadata_fields(group_field, jfield, '__calour_final_field', axis='s')
+
     samples = []
     for cval in exp.sample_metadata[jfield].unique():
         cexp = exp.filter_samples(jfield, cval)
+        if len(cexp.sample_metadata[group_field].unique()) < len(exp.sample_metadata[group_field].unique()):
+            logger.info('value %s in not present in all groups' % cval)
+            continue
         if len(cexp.sample_metadata['__calour_final_field'].unique()) == 1:
             continue
         cexp = cexp.downsample('__calour_final_field', inplace=True, random_seed=random_seed)
@@ -507,7 +517,7 @@ def focus_features(exp, ids, inplace=False, focus_feature_field='_calour_util_fo
     return newexp
 
 
-def alpha_diversity_as_feature(exp):
+def alpha_diversity_as_feature(exp, method='entropy'):
     data = exp.get_data(sparse=False, copy=True)
     data[data < 1] = 1
     entropy = []
@@ -1376,7 +1386,7 @@ def cluster_by_terms(exp, min_score_threshold=0.1, filter_ratio=1.01):
         with features clustered by dbbact terms
     '''
     # create an experiment of terms (as features) X features (as samples)
-    db = db = ca.database._get_database_class('dbbact')
+    db = ca.database._get_database_class('dbbact')
     logger.info('getting per-feature terms for %d terms' % len(exp.feature_metadata))
     texp = db.sample_term_scores(exp, term_type='fscore', axis='f')
     texp.data[texp.data < min_score_threshold] = min_score_threshold
@@ -1553,6 +1563,7 @@ def bicluster_enrichment(exp, min_prevalence=0.05, std_thresh=None, transform='n
     else:
         raise ValueError('transform %s not supported' % transform)
 
+    # prepare the scaled data (mean 0 std 1) on each axis separately
     data_norm_per_feature = sklearn.preprocessing.scale(data, axis=0)
     data_norm_per_sample = sklearn.preprocessing.scale(data, axis=1)
 
@@ -1574,6 +1585,9 @@ def bicluster_enrichment(exp, min_prevalence=0.05, std_thresh=None, transform='n
         print('std threshold:', std_thresh)
 
     for citer in range(max_iterations):
+        # initialize the per-sample scaling score (for the naama barkai algorithm)
+        # https://www.nature.com/articles/ng941z
+        sample_scores = np.zeros([num_samples])
         for caxis, cdim in zip(['s', 'f'], [0, 1]):
             if caxis == 's':
                 cdata = data_norm_per_feature
@@ -1582,7 +1596,8 @@ def bicluster_enrichment(exp, min_prevalence=0.05, std_thresh=None, transform='n
                 cg = cdata[samples, :]
                 cng = cdata[mask, :]
             else:
-                cdata = data_norm_per_sample
+                cdata = data_norm_per_sample.copy()
+                # cdata = cdata * np.tile(sample_scores, )
                 mask = np.ones([num_features], dtype=bool)
                 mask[features] = False
                 cg = cdata[:, features]
@@ -1595,11 +1610,9 @@ def bicluster_enrichment(exp, min_prevalence=0.05, std_thresh=None, transform='n
             ok = np.where(diff > std_thresh)[0]
             if caxis == 's':
                 features = ok
-                remaining = 'features'
             else:
                 samples = ok
-                remaining = 'samples'
-#             print(remaining, len(ok))
+
     print('samples: %d, features: %d' % (len(samples), len(features)))
     if len(samples) == 0 or len(features) == 0:
         print('clustering failed. try again with a lower std_thresh ')
@@ -1632,8 +1645,12 @@ def bicluster_enrichment(exp, min_prevalence=0.05, std_thresh=None, transform='n
     for cfield in exp.sample_metadata.columns:
         cunique = exp.sample_metadata[cfield].unique()
         num_unique = len(cunique)
+
+        # 1 value - no enrichment
         if num_unique == 1:
             continue
+
+        # a lor of values - so look for correlation (if numeric)
         if num_unique > np.max([num_samples / 10, 3]):
             try:
                 cdata = exp.sample_metadata[cfield].astype(float)
@@ -1642,6 +1659,8 @@ def bicluster_enrichment(exp, min_prevalence=0.05, std_thresh=None, transform='n
                 continue
             except:
                 continue
+
+        # a few categories
         for cval in cunique:
             field_vals.append('%s_:_%s' % (cfield, cval))
             cdata = (exp.sample_metadata[cfield] == cval).astype(bool)
@@ -1655,7 +1674,7 @@ def bicluster_enrichment(exp, min_prevalence=0.05, std_thresh=None, transform='n
     return exp, e, dd
 
 
-def health_index(exp, method=None):
+def health_index(exp, method=None, bad_features=None, good_features=None, field_name='_health_index', use_features='both', return_filtered=False):
     '''Calcuulate the per-sample health index (from "Meta-analysis defines predominant shared microbial responses in various diseases and a specific inflammatory bowel disease signal", https://doi.org/10.1186/s13059-022-02637-7)
 
     Parameters
@@ -1669,22 +1688,46 @@ def health_index(exp, method=None):
             None: no transform (the freq method for health index)
             'binarydata': do presence/absence based health index
             'rankdata': transform each feature to rank (across all samples)
-
+            'rankdata2': transform each feature to rank (across all features in each sample)
+    bad_features: str or None, optional
+        if None, use the default health-index bacteria file (from Abbas-Egbariya, Haya, et al. "Meta-analysis defines predominant shared microbial responses in various diseases and a specific inflammatory bowel disease signal." Genome Biology 23.1 (2022): 1-23.)
+        if not None, location of the feature_metadata file (tsv, row per feature, first column is the feature sequence) of features that go up in disease (i.e. higher in not healthy)
+    good_features: str of None, optional
+        similar to bad_features, but for the features that are lower in disease (i.e. higher in healthy)
+    field_name: str, optional
+        name of the sample_metadata column for the health index results
+    use_features: str, optional
+        'both': use up and down regulated bacteria
+        'healthy': use only the bacteria higher in health
+        'disease': use only bacteria lower in health
+    return_filtered: bool, optional
+        if True, return the experiment with only the health index features instead of all the features
     Returns
     -------
+    ca.AmpliconExperiment
+        with a new sample_metadata field named '_health_index'
     '''
     # load the non-specific bacteria
     data_dir = resource_filename(__package__, 'data')
-    # nsd = pd.read_csv('~/git/calour_utils/calour_utils/nonspecific-down_feature.txt', sep='\t', index_col=0)
-    nsd = pd.read_csv(os.path.join(data_dir, 'nonspecific-down_feature.txt'), sep='\t', index_col=0)
-    nsd['dir'] = 'down'
-    # nsu = pd.read_csv('~/git/calour_utils/calour_utils/nonspecific-up_feature.txt', sep='\t', index_col=0)
-    nsu = pd.read_csv(os.path.join(data_dir, 'nonspecific-up_feature.txt'), sep='\t', index_col=0)
-    nsu['dir'] = 'up'
-    nsf = nsd.merge(nsu, how='outer')
+    if bad_features is None:
+        bad_features = os.path.join(data_dir, 'nonspecific-up_feature.txt')
+    if good_features is None:
+        good_features = os.path.join(data_dir, 'nonspecific-down_feature.txt')
 
+    ns_good = pd.read_csv(good_features, sep='\t', index_col=0)
+    ns_good['dir'] = 'good'
+    ns_bad = pd.read_csv(bad_features, sep='\t', index_col=0)
+    ns_bad['dir'] = 'bad'
+    nsf = ns_good.merge(ns_bad, how='outer')
+
+    print('%d good, %d bad' % (len(ns_good), len(ns_bad)))
+
+    # create a single experiment with the good and bad features
     newexp = exp.copy()
     newexp = newexp.filter_ids(nsf._feature_id.values)
+    newexp.feature_metadata['_health_index_group'] = 'good'
+    newexp.feature_metadata.loc[newexp.feature_metadata.index.isin(ns_bad['_feature_id']), '_health_index_group'] = 'bad'
+
     newexp.sparse = False
 
     if method is None:
@@ -1693,18 +1736,355 @@ def health_index(exp, method=None):
         newexp.data = (newexp.data > 0)
     elif method == 'rankdata':
         newexp.data = scipy.stats.rankdata(newexp.data, axis=0)
+    elif method == 'rankdata2':
+        newexp.data = scipy.stats.rankdata(newexp.data, axis=1)
     else:
         raise ValueError('method %s not supported' % method)
 
-    upf = nsf[nsf['dir'] == 'up']['_feature_id'].values
-    downf = nsf[nsf['dir'] == 'down']['_feature_id'].values
+    bad_ids = nsf[nsf['dir'] == 'bad']['_feature_id'].values
+    good_ids = nsf[nsf['dir'] == 'good']['_feature_id'].values
 
-    upexp = newexp.filter_ids(upf)
-    nup = upexp.data.sum(axis=1)
-    downexp = newexp.filter_ids(downf)
-    ndown = downexp.data.sum(axis=1)
+    bad_exp = newexp.filter_ids(bad_ids)
+    bad_score = bad_exp.data.sum(axis=1)
+    good_exp = newexp.filter_ids(good_ids)
+    good_score = good_exp.data.sum(axis=1)
+    print('found %d bad, %d good' % (len(bad_exp.feature_metadata), len(good_exp.feature_metadata)))
     # we do "-" so high is healthy
-    dbi = - np.log2((nup + 0.1) / (ndown + 0.1))
-    exp = exp.copy()
-    exp.sample_metadata['_health_index'] = dbi
+    if use_features == 'both':
+        dbi = np.log2((good_score + 0.1) / (bad_score + 0.1))
+    elif use_features == 'disease':
+        dbi = - np.log2((bad_score + 0.1))
+    elif use_features == 'healthy':
+        dbi = np.log2((good_score + 0.1))
+    else:
+        raise ValueError('use_features method not supported (%s)' % use_features)
+
+    if return_filtered:
+        exp = newexp
+        print('returning filtered')
+    else:
+        exp = exp.copy()
+    exp.sample_metadata[field_name] = dbi
     return exp
+
+
+def plot_sample_term_scatter(exp, term1, term2, ignore_exp=True, transform='rankdata', field=None):
+    db = ca.database._get_database_class('dbbact')
+    db.add_all_annotations_to_exp(exp, max_id=None, force=False, get_parents=True)
+    exp = exp.copy()
+    sequence_terms = exp.databases['dbbact']['sequence_terms']
+    sequence_annotations = exp.databases['dbbact']['sequence_annotations']
+    annotations = exp.databases['dbbact']['annotations']
+    term_info = exp.databases['dbbact']['term_info']
+    focus_terms = [term1, term2]
+    # focus_terms=None
+    if focus_terms is not None:
+        focus_terms = set(focus_terms)
+        ok_annotations = {}
+        for cid, cannotation in annotations.items():
+            # check if an
+            found_terms = set()
+            for cdetail in cannotation['details']:
+                if cdetail[1] in focus_terms:
+                    found_terms.add(cdetail[1])
+            if len(found_terms) > 0:
+                ok_annotations[cid] = cannotation
+        logger.info('keeping %d out of %d annotations with all the terms (%s)' % (len(ok_annotations), len(annotations), focus_terms))
+        for k, v in sequence_annotations.items():
+            nv = [x for x in v if x in ok_annotations]
+            sequence_annotations[k] = nv
+
+    # change the sequence annotations from dict to list of tuples
+    sequence_annotations = [(k, v) for k, v in sequence_annotations.items()]
+
+    # set the experiments to ignore in the wordcloud
+    if ignore_exp is True:
+        if exp is None:
+            raise ValueError('Cannot use ignore_exp=True when exp is not supplied')
+        ignore_exp = db.db.find_experiment_id(datamd5=exp.info['data_md5'], mapmd5=exp.info['sample_metadata_md5'], getall=True)
+        if ignore_exp is None:
+            logger.warn('No matching experiment found in dbBact. Not ignoring any experiments')
+        else:
+            logger.info('Found %d experiments (%s) matching current experiment - ignoring them.' % (len(ignore_exp), ignore_exp))
+    if ignore_exp is None:
+        ignore_exp = []
+
+    # we need to rekey the annotations with an str (old problem...)
+    annotations = {str(k): v for k, v in annotations.items()}
+
+    logger.info('Getting per-sequence term f-scores')
+    seq_scores = {}
+    for cseq, canno in sequence_annotations:
+        cseqannotations = [(cseq, canno)]
+        res = db.get_enrichment_score(annotations=annotations, seqannotations=cseqannotations, term_info=term_info)
+        cf = res[0]
+        seq_scores[cseq] = {}
+        seq_scores[cseq][term1] = cf.get(term1, 0)
+        seq_scores[cseq][term2] = cf.get(term2, 0)
+
+    term1vec = np.array([seq_scores[cseq][term1] for cseq in exp.feature_metadata.index.values])
+    term2vec = np.array([seq_scores[cseq][term2] for cseq in exp.feature_metadata.index.values])
+
+    cdata = exp.get_data(copy=True, sparse=False)
+    if transform == 'log2data':
+        cdata[cdata < 1] = 1
+        cdata = np.log2(cdata)
+    elif transform == 'binarydata':
+        cdata = cdata > 0
+    elif transform == 'rankdata':
+        cdata = scipy.stats.rankdata(cdata, axis=0)
+
+    samp_term1 = np.matmul(cdata, term1vec)
+    samp_term2 = np.matmul(cdata, term2vec)
+
+    exp.sample_metadata['_coord_term1'] = samp_term1
+    exp.sample_metadata['_coord_term2'] = samp_term2
+
+    plt.figure()
+    labels = []
+    for cval, cexp in exp.iterate(field):
+        labels.append(cval)
+        plt.plot(cexp.sample_metadata['_coord_term1'], cexp.sample_metadata['_coord_term2'], '.')
+    plt.legend(labels)
+    plt.xlabel(term1)
+    plt.ylabel(term2)
+    plt.title(transform)
+
+
+def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_values=[], filter_na=True):
+    '''Test correlation/enrichment between sample metadata columns and a given value_field which is a sample metadata column (e.g. _health_index following cu.health_index() ).
+    Enrichment is performed on categorical metadata fields (comparing mann-whitney of value_field in the groups)
+    Correlation is performed on numeric metadata fields (spearman of value field and the metadata fields)
+
+    Parameters
+    ----------
+    exp: calour.Experiment
+    value_field: str
+        the name of the sample metadata field to compare to all the other fields (e.g. "_health_index")
+    alpha: float, optional
+        the FDR level (to correct for the multiple metadata fields tested)
+    ok_columns: list of str or None, optional
+        if not None, test only fields appeating in ok_columns instead of all the sample_metadata fields
+    bad_values: list of str, optional
+        values to not include in the testing (e.g. 'unknwon')
+    filter_na: bool, optional
+        True to remove samples with nan in their metadata field
+
+    Returns
+    -------
+    fields
+    stats
+    q (corrected p-values)
+    names
+    '''
+    amd = exp.sample_metadata.copy()
+    names = []
+    pvals = []
+    fields = []
+    stats = []
+    num_skipped = 0
+    if ok_columns is None:
+        ok_columns = amd.columns
+    for cfield in amd.columns:
+        if ok_columns is not None:
+            if cfield not in ok_columns:
+                continue
+        md = amd.copy()
+        # get rid of bad field values
+        for cignore in bad_values:
+            md = md[md[cfield] != cignore]
+        if filter_na:
+            md = md[md[cfield].notna()]
+
+        if len(md[cfield].unique()) == 1:
+            logger.debug('field %s contains 1 value. skipping' % cfield)
+            num_skipped += 1
+            continue
+        if len(md[cfield].unique()) >= 3:
+            # print('>=3 values for field %s' % cfield)
+            if not pd.to_numeric(md[cfield], errors='coerce').notnull().all():
+                num_skipped += 1
+                logger.debug('field %s is not numeric and contains >= 3 unique values. skipping' % cfield)
+                continue
+            if len(md) < 10:
+                pass
+                # continue
+            cres = scipy.stats.spearmanr(md[value_field], md[cfield])
+            names.append('COR: (%d) %s: %s' % (len(md), cfield, cres))
+            ccres = cres[0]
+        elif len(md[cfield].unique()) == 2:
+            # print('2 values for field %s' % cfield)
+            vals = sorted(md[cfield].unique())
+            cv1 = md[md[cfield] == vals[0]]
+            cv2 = md[md[cfield] == vals[1]]
+            cres = scipy.stats.mannwhitneyu(cv1[value_field], cv2[value_field], alternative='two-sided')
+            names.append('BIN: %s: %s (%d, %f), %s (%d, %f) %s' % (cfield, vals[0], len(cv1), np.median(cv1[value_field]), vals[1], len(cv2), np.median(cv2[value_field]), cres))
+            ccres = np.median(cv1[value_field]) - np.median(cv2[value_field])
+        else:
+            logger.debug('no values for field %s' % cfield)
+            num_skipped += 1
+            continue
+        pvals.append(cres[1])
+        fields.append(cfield)
+        stats.append(ccres)
+    if num_skipped > 0:
+        logger.info('skipped %d (out of %d) fields with inappropriate values' % (num_skipped, len(amd.columns)))
+    if len(pvals) == 0:
+        logger.error('no fields with matching values detected')
+        return [], [], [], []
+    reject, q, aaa, bbb = multipletests(pvals, alpha=alpha, method='fdr_bh')
+    # reject, q = statsmodels.stats.multitest.fdrcorrection(pvals,alpha=alpha,method='indep')
+    for idx, cname in enumerate(names):
+        if reject[idx]:
+            print(cname)
+    return fields, np.array(stats), np.array(q), names
+
+
+# for the group_dependence method
+def variance_stat(data, labels):
+    cstat = 0.1
+    for clab in list(set(labels)):
+        cdat = data[:, labels == clab]
+        ccstat = np.var(cdat, axis=1)
+        cstat += ccstat
+    return np.var(data, axis=1) / cstat
+
+
+def group_dependece(exp: ca.Experiment, field, method='variance', transform=None,
+                    numperm=1000, alpha=0.1, fdr_method='dsfdr', random_seed=None):
+    '''Find features with non-random group distribution based on within-group variance
+
+    The permutation based p-values and multiple hypothesis correction is implemented.
+
+    Parameters
+    ----------
+    field: str
+        The field to test by. Values are converted to numeric.
+    method : str or function
+        the method to use for the statistic. options:
+
+        * 'variance': sum of within-group variances
+        * callable: the callable to calculate the statistic (its input are
+          sample-by-feature numeric numpy.array and 1D numeric
+          numpy.array of sample metadata; output is a numpy.array of float)
+    transform : str or None
+        transformation to apply to the data before caluculating the statistic.
+
+        * 'rankdata' : rank transfrom each OTU reads
+        * 'log2data' : calculate log2 for each OTU using minimal cutoff of 2
+        * 'normdata' : normalize the data to constant sum per samples
+        * 'binarydata' : convert to binary absence/presence
+    alpha : float
+        the desired FDR control level (type I error rate)
+    numperm : int
+        number of permutations to perform
+    fdr_method : str
+        method to compute FDR. Allowed methods include:
+
+        * 'dsfdr': discrete FDR
+        * 'bhfdr': Benjamini-Hochberg FDR method
+        * 'byfdr' : Benjamini-Yekutielli FDR method
+        * 'filterBH' : Benjamini-Hochberg FDR method with filtering
+    random_seed : int, np.radnom.Generator instance or None, optional, default=None
+        set the random number generator seed for the random permutations
+        If int, random_seed is the seed used by the random number generator;
+        If Generator instance, random_seed is set to the random number generator;
+        If None, then fresh, unpredictable entropy will be pulled from the OS
+
+    Returns
+    -------
+    Experiment
+        The experiment with only correlated features, sorted according to correlation coefficient.
+
+        * '{}' : the non-adjusted p-values for each feature
+        * '{}' : the FDR-adjusted q-values for each feature
+        * '{}' : the statistics (correlation coefficient if
+          the `method` is 'spearman' or 'pearson'). If it
+          is larger than zero for a given feature, it indicates this
+          feature is positively correlated with the sample metadata;
+          otherwise, negatively correlated.
+        * '{}' : in which of the 2 sample groups this given feature is increased.
+    '''
+    if field not in exp.sample_metadata.columns:
+        raise ValueError('Field %s not in sample_metadata. Possible fields are: %s' % (field, exp.sample_metadata.columns))
+
+    cexp = exp.filter_sum_abundance(0, strict=True)
+
+    data = cexp.get_data(copy=True, sparse=False).transpose()
+
+    labels = np.zeros([len(exp.sample_metadata)])
+    for idx, clabel in enumerate(exp.sample_metadata[field].unique()):
+        labels[exp.sample_metadata[field] == clabel] = idx
+
+    # remove the nans
+    nanpos = np.where(np.isnan(labels))[0]
+    if len(nanpos) > 0:
+        logger.warning('NaN values encountered in labels for correlation. Ignoring these samples')
+        labels = np.delete(labels, nanpos)
+        data = np.delete(data, nanpos, axis=1)
+    if method == 'variance':
+        method = variance_stat
+    else:
+        raise ValueError('method %s not supported' % method)
+
+    # find the significant features
+    keep, odif, pvals, qvals = ca.dsfdr.dsfdr(data, labels, method=method, transform_type=transform, alpha=alpha, numperm=numperm, fdr_method=fdr_method, random_seed=random_seed)
+    logger.info('Positive dependent features : %d. Negative dependent features : %d. total %d'
+                % (np.sum(odif[keep] > 0), np.sum(odif[keep] < 0), np.sum(keep)))
+    newexp = ca.analysis._new_experiment_from_pvals(cexp, exp, keep, odif, pvals, qvals)
+    return newexp
+
+
+def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation': 90}, colors=None, show_stats=False):
+    '''Draw a violin plot for metadata distribution (numeric) between different metadata categories (categorical)
+    The plot shows a violin plot and the points (with random x jitter)
+
+    Parameters
+    ----------
+    exp: calour.Experiment
+    group_field: str
+        the categorical field to use for the x axis groups
+    value_field: str
+        the numeric field for the values within each group
+    xlabel_params: dict, optional
+        the additional parameters for the xtick lables
+
+    Returns
+    -------
+    labels: list of str - the ordered categoru names (i.e. group_filed)
+    vals: list of list of float
+        the values for each category
+    f: matplotlib.figure
+        the figure
+    '''
+    vals = []
+    labels = []
+    for clab, cexp in exp.iterate(group_field):
+        labels.append(clab)
+        vals.append(np.array(cexp.sample_metadata[value_field].values))
+
+    if colors is not None:
+        if isinstance(colors, str):
+            colors = [colors] * len(labels)
+
+    si = np.argsort(labels)
+    vals = [vals[x] for x in si]
+    labels = np.array(labels)[si]
+    f = plt.figure()
+    plt.violinplot(vals, showmedians=True)
+    for idx, cvals in enumerate(list(vals)):
+        offset = np.random.randn(len(cvals)) * 0.05
+        if colors is None:
+            plt.plot(offset + idx + 1, cvals, '.')
+        else:
+            plt.plot(offset + idx + 1, cvals, '.', c=colors[idx])
+    ax = plt.gca()
+    ax.set_xticks(np.arange(len(labels)) + 1)
+    ax.set_xticklabels(labels, **xlabel_params)
+    plt.xlabel(group_field)
+    plt.ylabel(value_field)
+
+    if show_stats:
+        if len(labels) == 2:
+            plt.title('Mann-Whitney: %s' % scipy.stats.mannwhitneyu(vals[0], vals[1])[1])
+    return labels, vals, f
