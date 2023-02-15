@@ -1084,7 +1084,8 @@ def trim_seqs(exp, new_len, pos='end'):
     new_exp = exp.copy()
     new_exp.feature_metadata['new_seq'] = new_seqs
     new_exp = new_exp.aggregate_by_metadata('new_seq', axis='f', agg='sum')
-    new_exp.feature_metadata = new_exp.feature_metadata.reindex(new_exp.feature_metadata['new_seq'])
+    # new_exp.feature_metadata = new_exp.feature_metadata.reindex(new_exp.feature_metadata['new_seq'])
+    new_exp.feature_metadata = new_exp.feature_metadata.set_index('new_seq',drop=False)
     new_exp.feature_metadata['_feature_id'] = new_exp.feature_metadata['new_seq']
     return new_exp
 
@@ -1505,12 +1506,249 @@ def plot_diff_term_tree(exp, term, relation='both', keep_only_diff=True, simplif
     return directed
 
 
-def bicluster_enrichment(exp, min_prevalence=0.05, std_thresh=None, transform='none', max_iterations=20, subset=None, random_seed=None, alpha=0.1):
+def bicluster(exp, cluster_method='std', min_prevalence=0.05, std_thresh=None, transform='none', max_iterations=20, subset=None, start_axis='f', random_seed=None):
+    '''Do unsupervised bi-clustering
+
+    Parameters
+    ----------
+    exp: calour.AmpliconExperiment
+    cluster_method: str, optional
+        ther clustering method to use. options are:
+        'barkai': based on the method of Ihmels et al (https://doi.org/10.1038/ng941). iterative clustering using stable clusters with lower standard deviation than expected by chance
+        'std': standard deviation difference between the two clusters
+        'linear': use two-line fit to identify cluster break point
+    min_prevalence: float or None, optional
+        the minimal prevalence for features to keep for the clustering (for filter_prevalence()) before the biclustering
+        if None, do not do filter_prevalence()
+    std_thresh: float or None, optional
+        if not None, the mean/std threshold to keep in the cluster
+        if None, randomize a threshold before the run
+    transform: str, optional
+        the transform on the data before the buclustering. options:
+            'binarydata': transform to presence/absence
+            'rankdata': rank each feature on the samples
+            'log2data': log2 pf the data. numbers<1 are changed to 1
+            'none': no transform
+    max_iterations: int, optional
+        the number of feature/sample iterations to perform
+    subset: int or list if int or None, optional
+        the number of samples or features to include in the initial seed samples for the algorithm (depending of start_axis).
+        if list of int, these are the sample positions (in the sample_metadata or feature_metadata dataframe) to use as the initial samples
+        If None, randomly select a part of the number of samples or features to use (uniform)
+    start_axis: 'f' or 's', optional
+        the starting axis - 'f' to first cluster features, 's' to first cluster samples
+    random_seed: int or None, optional
+        if not none, set the numpy random seed prior to running the clustering
+
+    Returns
+    -------
+    exp: calour.Experiment with '_bicluster' field in sample_metadata and feature_metadata (with values 1 for the cluster, 0 for the rest) or None if clustering failed
+    '''
+    import scipy as sp
+    if random_seed is not None:
+        np.random.seed(random_seed)
+    exp = exp.copy()
+    if min_prevalence is not None:
+        exp = exp.filter_prevalence(min_prevalence)
+
+    # The function for two-lines fit to a curve. used with the 'linear' option in the cluster_method
+    def two_lines(x, breakpoint, slope1, offset1, slope2):
+        res = np.zeros(len(x))
+        l1x = np.where(x < breakpoint)[0]
+        l2x = np.where(x >= breakpoint)[0]
+        res[l1x] = x[l1x] * slope1 + offset1
+        offset2 = slope1 * breakpoint + offset1
+        res[l2x] = (x[l2x] - breakpoint) * slope2 + offset2
+        return res
+
+    # if we want to first cluster features, transform the experiment at the beginning and end
+    if start_axis == 'f':
+        exp.data = exp.data.T
+        fmd = exp.feature_metadata
+        exp.feature_metadata = exp.sample_metadata
+        exp.sample_metadata = fmd
+
+    data = exp.get_data(sparse=False, copy=True)
+    if transform == 'binarydata':
+        data = (data > 0)
+    elif transform == 'rankdata':
+        data = scipy.stats.rankdata(data, axis=0)
+    elif transform == 'log2data':
+        data[data < 1] = 1
+        data = np.log2(data)
+    elif transform == 'none':
+        pass
+    else:
+        raise ValueError('transform %s not supported' % transform)
+
+    # prepare the scaled data (mean 0 std 1) on each axis separately
+    data_norm_per_feature = sklearn.preprocessing.scale(data, axis=0)
+    data_norm_per_sample = sklearn.preprocessing.scale(data, axis=1)
+    # data_norm_per_sample = data.copy()
+
+    num_samples = len(exp.sample_metadata)
+    num_features = len(exp.feature_metadata)
+
+    if subset is None:
+        subset = int(num_samples * np.random.rand())
+        logger.debug('subset is None, so randmoly selected initial number of samples: %d' % subset)
+
+    if isinstance(subset, list) or isinstance(subset, tuple) or isinstance(subset, np.ndarray):
+        samples = subset
+    else:
+        samples = np.random.permutation(np.arange(num_samples))
+        samples = samples[:subset]
+    features = np.arange(num_features)
+
+    if std_thresh is None:
+        # std_thresh = np.abs(np.random.rand()*2 + 2)
+        std_thresh = np.abs(np.random.rand() * 0.3 + 0.7)
+        logger.debug('std_thresh is None so randomly set std threshold: %f' % std_thresh)
+
+    for citer in range(max_iterations):
+        # initialize the per-sample scaling score (for the naama barkai algorithm)
+        # https://www.nature.com/articles/ng941z
+        for caxis, cdim in zip(['s', 'f'], [0, 1]):
+            if caxis == 's':
+                cdata = data_norm_per_feature.copy()
+                mask = np.ones([num_samples], dtype=bool)
+                mask[samples] = False
+                cg = cdata[samples, :]
+                cng = cdata[mask, :]
+            else:
+                cdata = data_norm_per_sample.copy()
+                # cdata = cdata * np.tile(sample_scores, )
+                mask = np.ones([num_features], dtype=bool)
+                mask[features] = False
+                cg = cdata[:, features]
+                cng = cdata[:, mask]
+
+            # identify the samples or features to keep. Put their indices in the variable "ok"
+
+            if cluster_method == 'std':
+                # get the std on the other dimension (i.e. for each feature if we are looking on the samples)
+                cstd = np.std(cdata, axis=cdim)
+                mean_in = np.mean(cg, axis=cdim)
+                mean_out = np.mean(cng, axis=cdim)
+                diff = (mean_in - mean_out) / (cstd + 0.0000001)
+                ok = np.where(diff > std_thresh)[0]
+
+            elif cluster_method == 'barkai':
+                cstd = np.std(cdata, axis=cdim)
+                cstd = np.std(cg, axis=cdim)
+                mean_in = np.mean(cg, axis=cdim)
+                mean_all = np.mean(cdata, axis=cdim)
+                diff = (mean_in - mean_all) / (cstd + 0.0000001)
+                ok = np.where(diff > std_thresh / np.sqrt(len(features)))[0]
+                # if citer % 6 == 0:
+                #     std_thresh = std_thresh * 1.1
+
+            elif cluster_method == 'dsfdr':
+                labels = np.zeros(mask.shape)
+                labels[mask] = 1
+                # print(cdata.shape)
+                # print(labels.shape)
+                if caxis == 'f':
+                    ccdata = cdata
+                else:
+                    ccdata = cdata.T
+                reject, tstat, pvals, qvals = ca.dsfdr.dsfdr(ccdata, labels)
+                # print('keeping %d for axis %s' % (np.sum(reject), caxis))
+                ok = np.where(reject)[0]
+
+            elif cluster_method == 'linear':
+                cvn = np.mean(cg, axis=cdim) - np.mean(cng, axis=cdim)
+                ci = np.argsort(cvn)
+                cv = cvn[ci]
+                cv = np.log2(1 + cv - np.min(cv))
+
+                midpoint = int(len(cv) / 2)
+                initial_breakpoint = int(len(cv) * 3 / 4)
+                # res = scipy.optimize.curve_fit(two_lines, np.arange(len(cv)), cv, p0=(initial_breakpoint, (cv[midpoint] - cv[0]) * 2 / len(cv), 0, (cv[-1] - cv[midpoint]) * 2 / len(cv)))
+                score=[]
+                d1s=[]
+                d2s=[]
+                for cbp in range(int(len(cv)*2 / 3),len(cv)-5):
+                    x1 = np.arange(cbp)
+                    res = sp.stats.linregress(x1, cv[:cbp])
+                    a1=res.slope
+                    b1=res.intercept
+                    # a1,b1=np.polyfit(x1,cv[:cbp],1)
+                    d1 = np.sum(np.abs(cv[:cbp] - (a1*x1+b1)))
+
+                    x2 = np.arange(cbp,len(cv))
+                    # a2,b2=np.polyfit(x2,cv[cbp:],1)
+                    res2 = sp.stats.linregress(x2, cv[cbp:])
+                    a2=res2.slope
+                    b2=res2.intercept
+                    d2 = np.sum(np.abs(cv[cbp:] - (a2*x2+b2)))
+                    score.append(d1+d2)
+                    d1s.append(d1)
+                    d2s.append(d2)
+                # plt.figure()
+                # plt.plot(np.arange(len(score)),score,'b')
+                # plt.plot(np.arange(len(score)),d1s,'r')
+                # plt.plot(np.arange(len(score)),d2s,'k')
+                # plt.legend(['total','d1','d2'])
+                minpos=np.argmin(score)+int(len(cv)*2 / 3)
+                # print(minpos)
+                # plt.figure()
+                # xp = np.arange(len(cv))
+                # plt.plot(xp,cv,'.k')
+                # # plt.plot(xp,two_lines(xp,*res[0]),'r')
+                # plt.plot(minpos,cv[minpos],'ob')
+                # plt.title(caxis)
+                # ok = ci[int(res[0][0]):]
+                ok = ci[minpos:]
+            else:
+                raise ValueError('cluster_method %s not supported' % cluster_method)
+            if caxis == 's':
+                features = ok
+            else:
+                samples = ok
+            if len(ok) == 0:
+                logger.debug('empty cluster reached')
+                return None
+
+    # print('samples: %d, features: %d' % (len(samples), len(features)))
+    if len(samples) == 0 or len(features) == 0:
+        logger.info('No stable cluster found')
+        return None
+
+    mask = np.zeros([num_samples])
+    mask[samples] = 1
+    exp.sample_metadata['_bicluster'] = mask
+    exp.sample_metadata['_bicluster'] = exp.sample_metadata['_bicluster'].astype(str)
+    mask = np.zeros([num_features])
+    mask[features] = 1
+    exp.feature_metadata['_bicluster'] = mask
+    exp.feature_metadata['_bicluster'] = exp.feature_metadata['_bicluster'].astype(str)
+
+    not_samples = np.delete(np.arange(num_samples), samples)
+    not_features = np.delete(np.arange(num_features), features)
+    exp = exp.reorder(np.hstack([samples, not_samples]), axis='s')
+    exp = exp.reorder(np.hstack([features, not_features]), axis='f')
+
+    # now flip back if needed
+    if start_axis == 'f':
+        exp.data = exp.data.T
+        fmd = exp.feature_metadata
+        exp.feature_metadata = exp.sample_metadata
+        exp.sample_metadata = fmd
+    return exp
+
+
+def bicluster_enrichment(exp, cluster_method='std', min_prevalence=0.05, std_thresh=None, transform='none', max_iterations=20, subset=None, start_axis='f', random_seed=None, alpha=0.1, num_clusters=0):
     '''Do unsupervised bi-clustering, and test the resulting cluster for feature (via dbBact) and sample (via all the metadata fields) enrichment
 
     Parameters
     ----------
     exp: calour.AmpliconExperiment
+    cluster_method: str, optional
+        ther clustering method to use. options are:
+        'barkai': based on the method of Ihmels et al (https://doi.org/10.1038/ng941). iterative clustering using stable clusters with lower standard deviation than expected by chance
+        'std': standard deviation difference between the two clusters
+
     min_prevalence: float or None, optional
         the minimal prevalence for features to keep for the clustering (for filter_prevalence()) before the biclustering
         if None, do not do filter_prevalence()
@@ -1529,10 +1767,15 @@ def bicluster_enrichment(exp, min_prevalence=0.05, std_thresh=None, transform='n
         the number of samples to include in the initial seed samples for the algorithm.
         if list of int, these are the sample positions (in the sample_metadata dataframe) to use as the initial samples
         If None, randomly select a part of the number of samples to use (uniform)
+    start_axis: 'f' or 's', optional
+        the starting axis - 'f' to first cluster features, 's' to first cluster samples
     random_seed: int or None, optional
         if not none, set the numpy random seed prior to running the clustering
     alpha: float, optional
         the alpha dsFDR threshold for the sample metadata enrichment
+    num_clusters: int, optional
+        if not None, the number of non-overlapping clusters to identify
+        if 0, run only once (one cluster)
 
     Returns
     -------
@@ -1547,131 +1790,257 @@ def bicluster_enrichment(exp, min_prevalence=0.05, std_thresh=None, transform='n
     '''
     if random_seed is not None:
         np.random.seed(random_seed)
-    exp = exp.copy()
+
+    # we do the min_prevalence filtering here since we run multiple times
     if min_prevalence is not None:
         exp = exp.filter_prevalence(min_prevalence)
-    data = exp.get_data(sparse=False, copy=True)
-    if transform == 'binarydata':
-        data = (data > 0)
-    elif transform == 'rankdata':
-        data = scipy.stats.rankdata(data, axis=0)
-    elif transform == 'log2data':
-        data[data < 1] = 1
-        data = np.log2(data)
-    elif transform == 'none':
-        pass
-    else:
-        raise ValueError('transform %s not supported' % transform)
 
-    # prepare the scaled data (mean 0 std 1) on each axis separately
-    data_norm_per_feature = sklearn.preprocessing.scale(data, axis=0)
-    data_norm_per_sample = sklearn.preprocessing.scale(data, axis=1)
+    orig_exp = exp.copy()
 
-    num_samples = len(exp.sample_metadata)
-    num_features = len(exp.feature_metadata)
+    cluster_features = []
+    cluster_samples = []
+    finished = False
+    num_tries = 0
 
-    if subset is None:
-        subset = int(num_samples * np.random.rand())
-        print('initial number of samples: %d' % subset)
-    if isinstance(subset, list) or isinstance(subset, tuple) or isinstance(subset, np.ndarray):
-        samples = subset
-    else:
-        samples = np.random.permutation(np.arange(num_samples))
-        samples = samples[:subset]
-    features = np.arange(num_features)
+    while not finished:
+        num_tries += 1
+        exp = bicluster(orig_exp, cluster_method=cluster_method, min_prevalence=None, std_thresh=std_thresh, transform=transform, max_iterations=max_iterations, subset=subset, start_axis=start_axis, random_seed=random_seed)
 
-    if std_thresh is None:
-        std_thresh = np.abs(np.random.rand())
-        print('std threshold:', std_thresh)
-
-    for citer in range(max_iterations):
-        # initialize the per-sample scaling score (for the naama barkai algorithm)
-        # https://www.nature.com/articles/ng941z
-        sample_scores = np.zeros([num_samples])
-        for caxis, cdim in zip(['s', 'f'], [0, 1]):
-            if caxis == 's':
-                cdata = data_norm_per_feature
-                mask = np.ones([num_samples], dtype=bool)
-                mask[samples] = False
-                cg = cdata[samples, :]
-                cng = cdata[mask, :]
+        # check if it a new cluster (by examining overlap < 90% with all previous clusters of samples and features)
+        if exp is not None:
+            cf = set(exp.feature_metadata[exp.feature_metadata._bicluster == '1.0']._feature_id.values)
+            ncf = set(exp.feature_metadata[exp.feature_metadata._bicluster == '0.0']._feature_id.values)
+            new_features = True
+            for cfeat in cluster_features:
+                if len(cfeat.intersection(cf)) > 0.9 * np.max([len(cfeat), len(cf)]):
+                    new_features = False
+                    break
+                if len(cfeat.intersection(ncf)) > 0.9 * np.max([len(cfeat), len(ncf)]):
+                    new_features = False
+                    break
+            cs = set(exp.sample_metadata[exp.sample_metadata._bicluster == '1.0']._sample_id.values)
+            ncs = set(exp.sample_metadata[exp.sample_metadata._bicluster == '0.0']._sample_id.values)
+            new_samples = True
+            for csamp in cluster_samples:
+                if len(csamp.intersection(cs)) > 0.9 * np.max([len(csamp), len(cs)]):
+                    new_samples = False
+                    break
+                if len(csamp.intersection(ncs)) > 0.9 * np.max([len(csamp), len(ncs)]):
+                    new_samples = False
+                    break
+            logger.debug('got cluster with %d samples, %d features' % (len(cs), len(cf)))
+            if new_features and new_samples:
+                cluster_features.append(cf)
+                cluster_samples.append(cs)
+                logger.debug('it is a new cluster. added')
             else:
-                cdata = data_norm_per_sample.copy()
-                # cdata = cdata * np.tile(sample_scores, )
-                mask = np.ones([num_features], dtype=bool)
-                mask[features] = False
-                cg = cdata[:, features]
-                cng = cdata[:, mask]
-            # get the std on the other dimension (i.e. for each feature if we are looking on the samples)
-            cstd = np.std(cdata, axis=cdim)
-            mean_in = np.mean(cg, axis=cdim)
-            mean_out = np.mean(cng, axis=cdim)
-            diff = (mean_in - mean_out) / cstd
-            ok = np.where(diff > std_thresh)[0]
-            if caxis == 's':
-                features = ok
-            else:
-                samples = ok
+                logger.debug('cluster overlaps with old cluster')
+        # if len(cluster_features) >= num_clusters:
+        #     finished = True
+        if num_tries > num_clusters * 5:
+            finished = True
 
-    print('samples: %d, features: %d' % (len(samples), len(features)))
-    if len(samples) == 0 or len(features) == 0:
-        print('clustering failed. try again with a lower std_thresh ')
-        return None, None, None
+    if len(cluster_features) == 0:
+        logger.warning('did not find any clusters')
+        return
 
-    mask = np.zeros([num_samples])
-    mask[samples] = 1
-    exp.sample_metadata['_bicluster'] = mask
-    exp.sample_metadata['_bicluster'] = exp.sample_metadata['_bicluster'].astype(str)
-    mask = np.zeros([num_features])
-    mask[features] = 1
-    exp.feature_metadata['_bicluster'] = mask
-    exp.feature_metadata['_bicluster'] = exp.feature_metadata['_bicluster'].astype(str)
-    not_samples = np.delete(np.arange(num_samples), samples)
-    not_features = np.delete(np.arange(num_features), features)
-    exp = exp.reorder(np.hstack([samples, not_samples]), axis='s')
-    exp = exp.reorder(np.hstack([features, not_features]), axis='f')
+    logger.info('found %d unique clusters' % len(cluster_samples))
 
-    exp.plot(gui='cli', barx_fields=['_bicluster'], bary_fields=['_bicluster'])
+    # calculate the cluster score for each cluster
+    scores = np.zeros([len(cluster_samples)])
+    for idx, (csamp, cfeat) in enumerate(zip(cluster_samples, cluster_features)):
+        cexp = orig_exp.filter_ids(cfeat)
+        mean_in = cexp.filter_ids(csamp, axis='s').data.mean()
+        mean_out = cexp.filter_ids(csamp, axis='s', negate=True).data.mean()
+        scores[idx] = mean_in / mean_out
 
-    print('*** features')
-    dd = exp.diff_abundance('_bicluster', '0.0', '1.0', alpha=1)
-    f, e = dd.plot_diff_abundance_enrichment()
-#     print(e.feature_metadata.to_html())
-    display(e.feature_metadata)
+    idx = np.argsort(scores)
+    cluster_features = [cluster_features[x] for x in idx[::-1]]
+    cluster_samples = [cluster_samples[x] for x in idx[::-1]]
+    scores = scores[idx]
 
-    # metadata enrichment
-    mddat = np.zeros([0, num_samples])
-    field_vals = []
-    for cfield in exp.sample_metadata.columns:
-        cunique = exp.sample_metadata[cfield].unique()
-        num_unique = len(cunique)
+    # add all annotations once so will speed up the enrichment analysis
+    logger.debug('Adding dbBact annotations for enrichment analysis')
+    db = ca.database._get_database_class('dbbact')
+    db.add_all_annotations_to_exp(orig_exp)
 
-        # 1 value - no enrichment
-        if num_unique == 1:
-            continue
+    num_samples = len(orig_exp.sample_metadata)
 
-        # a lor of values - so look for correlation (if numeric)
-        if num_unique > np.max([num_samples / 10, 3]):
-            try:
-                cdata = exp.sample_metadata[cfield].astype(float)
+    exp_list = []
+    for csamp, cfeat in zip(cluster_samples, cluster_features):
+        exp = orig_exp.copy()
+        print('***************************************')
+        csamp = list(csamp)
+        cfeat = list(cfeat)
+        exp.sample_metadata['_bicluster'] = '0.0'
+        exp.sample_metadata.loc[csamp, '_bicluster'] = '1.0'
+        exp.feature_metadata['_bicluster'] = '0.0'
+        exp.feature_metadata.loc[cfeat, '_bicluster'] = '1.0'
+        # return exp
+        exp = exp.sort_samples('_bicluster')
+        exp = exp.sort_by_metadata('_bicluster', axis='f')
+        exp.plot(gui='cli', barx_fields=['_bicluster'], bary_fields=['_bicluster'])
+
+        exp_list.append(exp)
+
+        print('*** features')
+        dd = exp.diff_abundance('_bicluster', '0.0', '1.0', alpha=1)
+        f, e = dd.plot_diff_abundance_enrichment()
+    #     print(e.feature_metadata.to_html())
+        display(e.feature_metadata)
+
+        # metadata enrichment
+        mddat = np.zeros([0, num_samples])
+        field_vals = []
+        for cfield in exp.sample_metadata.columns:
+            cunique = exp.sample_metadata[cfield].unique()
+            num_unique = len(cunique)
+
+            # 1 value - no enrichment
+            if num_unique == 1:
+                continue
+
+            # a lot of values - so look for correlation (if numeric)
+            if num_unique > np.max([num_samples / 10, 3]):
+                try:
+                    cdata = exp.sample_metadata[cfield].astype(float)
+                    mddat = np.vstack([mddat, np.array(cdata)])
+                    field_vals.append('%s_:_continuous' % (cfield))
+                    continue
+                except:
+                    continue
+
+            # a few categories
+            for cval in cunique:
+                field_vals.append('%s_:_%s' % (cfield, cval))
+                cdata = (exp.sample_metadata[cfield] == cval).astype(bool)
                 mddat = np.vstack([mddat, np.array(cdata)])
-                field_vals.append('%s_:_continuous' % (cfield))
-                continue
-            except:
+        # print(field_vals)
+
+        mdexp = ca.Experiment(mddat.T, exp.sample_metadata, pd.DataFrame(field_vals, columns=['_feature_id'], index=field_vals))
+        dd = mdexp.diff_abundance('_bicluster', '0.0', '1.0', alpha=alpha)
+        print('*** samples')
+    #     print(dd.feature_metadata.to_html())
+        display(dd.feature_metadata)
+        print('------------------------------')
+    return exp_list, e, dd
+
+
+def bicluster_analysis(exp, min_prevalence=0.2, include_subsets=True):
+    clusters = []
+    cluster_exps = []
+    exp = exp.copy()
+    subset = None
+
+    if min_prevalence is not None:
+        exp = exp.filter_prevalence(min_prevalence)
+
+    # add dbBact annotations (so we do it only once and then use for all dbBact term enrichment per-cluster)
+    db = ca.database._get_database_class('dbbact')
+    db.add_all_annotations_to_exp(exp, force=True)
+
+    use_exps = [exp]
+
+    # find biclusters
+    for i in range(100):
+        cexp = use_exps[np.random.randint(len(use_exps))]
+        print(cexp)
+        # res = bicluster(cexp, cluster_method='barkai', transform='binarydata', max_iterations=20, start_axis='f', subset=None)
+        res = bicluster(cexp, cluster_method='barkai', transform='rankdata', max_iterations=20, start_axis='f', subset=None)
+        print('clustered')
+        if res is None:
+            subset = None
+            continue
+        samples = set(np.where(res.sample_metadata['_bicluster'] == '1.0')[0])
+        features = set(np.where(res.feature_metadata['_bicluster'] == '1.0')[0])
+        not_samples = set(np.where(res.sample_metadata['_bicluster'] == '0.0')[0])
+        not_features = set(np.where(res.feature_metadata['_bicluster'] == '0.0')[0])
+        foundit = False
+        if len(samples) < 5:
+            continue
+        if len(features) < 5:
+            continue
+        for (csamp, cfeat) in clusters:
+            if len(csamp.intersection(samples)) > 0.8 * np.max([len(csamp), len(samples)]):
+                if len(cfeat.intersection(features)) > 0.8 * np.max([len(cfeat), len(features)]):
+                    foundit = True
+                    break
+            if len(csamp.intersection(not_samples)) > 0.8 * np.max([len(csamp), len(not_samples)]):
+                if len(cfeat.intersection(not_features)) > 0.8 * np.max([len(cfeat), len(not_features)]):
+                    foundit = True
+                    break
+        if foundit:
+            print('found it')
+            subset = None
+        else:
+            print('not found')
+            clusters.append((samples, features))
+            cluster_exps.append(res)
+            if include_subsets:
+                print('adding subset')
+                tt = res.filter_samples('_bicluster', '0.0').filter_by_metadata('_bicluster', ['0.0'], axis='f')
+                if len(tt.sample_metadata) > 10 and len(tt.feature_metadata) > 10:
+                    use_exps.append(tt)
+                tt = res.filter_samples('_bicluster', '1.0').filter_by_metadata('_bicluster', ['1.0'], axis='f')
+                if len(tt.sample_metadata) > 10 and len(tt.feature_metadata) > 10:
+                    use_exps.append(tt)
+                print('ok')
+            subset = np.random.permutation(np.where(res.sample_metadata == '0.0')[0])
+            if len(subset) > 20:
+                subset = subset[:20]
+            print('ok2')
+    print('found %d biclusters' % len(clusters))
+
+    for idx, cexp in enumerate(cluster_exps):
+        print('idx: %d (%r)' % (idx, cexp))
+        cexp = cexp.sort_samples('_bicluster')
+        cexp = cexp.sort_by_metadata('_bicluster', axis='f')
+        alpha = 0.1
+        num_samples = len(cexp.sample_metadata)
+
+        cexp.plot(gui='cli', barx_fields=['_bicluster'], bary_fields=['_bicluster'])
+
+        print('*** features')
+        dd = cexp.diff_abundance('_bicluster', '0.0', '1.0', alpha=1)
+        f, e = dd.plot_diff_abundance_enrichment()
+    #     print(e.feature_metadata.to_html())
+        # display(e.feature_metadata)
+
+        # metadata enrichment
+        mddat = np.zeros([0, num_samples])
+        field_vals = []
+        for cfield in cexp.sample_metadata.columns:
+            cunique = cexp.sample_metadata[cfield].unique()
+            num_unique = len(cunique)
+
+            # 1 value - no enrichment
+            if num_unique == 1:
                 continue
 
-        # a few categories
-        for cval in cunique:
-            field_vals.append('%s_:_%s' % (cfield, cval))
-            cdata = (exp.sample_metadata[cfield] == cval).astype(bool)
-            mddat = np.vstack([mddat, np.array(cdata)])
+            # a lor of values - so look for correlation (if numeric)
+            if num_unique > np.max([num_samples / 10, 3]):
+                try:
+                    cdata = cexp.sample_metadata[cfield].astype(float)
+                    mddat = np.vstack([mddat, np.array(cdata)])
+                    field_vals.append('%s_:_continuous' % (cfield))
+                    continue
+                except:
+                    continue
 
-    mdexp = ca.Experiment(mddat.T, exp.sample_metadata, pd.DataFrame(field_vals, columns=['_feature_id'], index=field_vals))
-    dd = mdexp.diff_abundance('_bicluster', '0.0', '1.0', alpha=alpha)
-    print('*** samples')
-#     print(dd.feature_metadata.to_html())
-    display(dd.feature_metadata)
-    return exp, e, dd
+            # a few categories
+            for cval in cunique:
+                field_vals.append('%s_:_%s' % (cfield, cval))
+                cdata = (cexp.sample_metadata[cfield] == cval).astype(bool)
+                mddat = np.vstack([mddat, np.array(cdata)])
+
+        mdexp = ca.Experiment(mddat.T, cexp.sample_metadata, pd.DataFrame(field_vals, columns=['_feature_id'], index=field_vals))
+        dd = mdexp.diff_abundance('_bicluster', '0.0', '1.0', alpha=alpha)
+        print('*** samples')
+    #     print(dd.feature_metadata.to_html())
+        display(dd.feature_metadata)
+
+        #     cu.splot(exp,'_bicluster',barx_fields=['_bicluster'],bary_fields=['_bicluster'])
+    return cluster_exps
 
 
 def health_index(exp, method=None, bad_features=None, good_features=None, field_name='_health_index', use_features='both', return_filtered=False):
@@ -1730,8 +2099,10 @@ def health_index(exp, method=None, bad_features=None, good_features=None, field_
 
     newexp.sparse = False
 
+    # the epsilon to add in case we get 0 bacteria in the good or bad groups
+    eps = 0.1
     if method is None:
-        pass
+        eps = 1
     elif method == 'binarydata':
         newexp.data = (newexp.data > 0)
     elif method == 'rankdata':
@@ -1747,15 +2118,16 @@ def health_index(exp, method=None, bad_features=None, good_features=None, field_
     bad_exp = newexp.filter_ids(bad_ids)
     bad_score = bad_exp.data.sum(axis=1)
     good_exp = newexp.filter_ids(good_ids)
+    good_exp.save('./tt')
     good_score = good_exp.data.sum(axis=1)
-    print('found %d bad, %d good' % (len(bad_exp.feature_metadata), len(good_exp.feature_metadata)))
+    logger.info('found %d bad, %d good' % (len(bad_exp.feature_metadata), len(good_exp.feature_metadata)))
     # we do "-" so high is healthy
     if use_features == 'both':
-        dbi = np.log2((good_score + 0.1) / (bad_score + 0.1))
+        dbi = np.log2((good_score + eps) / (bad_score + eps))
     elif use_features == 'disease':
-        dbi = - np.log2((bad_score + 0.1))
+        dbi = - np.log2((bad_score + eps))
     elif use_features == 'healthy':
-        dbi = np.log2((good_score + 0.1))
+        dbi = np.log2((good_score + eps))
     else:
         raise ValueError('use_features method not supported (%s)' % use_features)
 
@@ -2088,3 +2460,44 @@ def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation
         if len(labels) == 2:
             plt.title('Mann-Whitney: %s' % scipy.stats.mannwhitneyu(vals[0], vals[1])[1])
     return labels, vals, f
+
+
+def exp_from_fasta(file1, file2, group_names=['s1', 's2']):
+    '''Prepare a calour.AmpliconExperiment from two fastafiles and run diff_abundance on it.
+
+    Parameters
+    ----------
+    files,file2: str
+        Name of the fasta files to load for group1 and group2
+    group_names: list of (str, str), optional
+        name of the two fasta file groups
+
+    Returns
+    -------
+    ca.AmpliconExperiment
+    '''
+    g1 = []
+    for chead, cseq in ca.io._iter_fasta(file1):
+        g1.append(cseq)
+    logger.info('Loaded %d sequences from file %s' % (len(g1), file1))
+    g2 = []
+    for chead, cseq in ca.io._iter_fasta(file2):
+        g2.append(cseq)
+    logger.info('Loaded %d sequences from file %s' % (len(g2), file2))
+
+    smd = pd.DataFrame(group_names, columns=['_sample_id'])
+    smd = smd.set_index('_sample_id', drop=False)
+
+    st = np.ones(len(g1) + len(g2))
+    st[:len(g1)] = 0
+    fmd = pd.DataFrame(st, columns=['type'])
+    fmd['_feature_id'] = g1 + g2
+    fmd = fmd.set_index('_feature_id', drop=False)
+
+    data = np.zeros([len(smd), len(fmd)])
+    data[0, :len(g1)] = 1
+    data[1, len(g1):] = 1
+
+    exp = ca.AmpliconExperiment(data=data, feature_metadata=fmd, sample_metadata=smd, sparse=False)
+    dd = exp.diff_abundance('_sample_id', group_names[0], group_names[1], alpha=1)
+    return dd
