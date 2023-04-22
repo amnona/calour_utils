@@ -2407,7 +2407,7 @@ def group_dependece(exp: ca.Experiment, field, method='variance', transform=None
     return newexp
 
 
-def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation': 90}, colors=None, show_stats=False):
+def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation': 90}, colors=None, show_stats=False, show_labels=True, figsize=None):
     '''Draw a violin plot for metadata distribution (numeric) between different metadata categories (categorical)
     The plot shows a violin plot and the points (with random x jitter)
 
@@ -2420,6 +2420,14 @@ def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation
         the numeric field for the values within each group
     xlabel_params: dict, optional
         the additional parameters for the xtick lables
+    colors: str or list of str, optional
+        the colors to use for each group (if str, use a single color for all labels, if Nonr, use default colors)
+    show_stats: bool, optional
+        If True, show the Mann-Whitney U test p-value between the first and second group
+    show_labels: bool, optional
+        If True, show the axis labels
+    figsize: None or tuple of int, optional
+        the figure size (if None, use default)
 
     Returns
     -------
@@ -2442,7 +2450,7 @@ def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation
     si = np.argsort(labels)
     vals = [vals[x] for x in si]
     labels = np.array(labels)[si]
-    f = plt.figure()
+    f = plt.figure(figsize=figsize)
     plt.violinplot(vals, showmedians=True)
     for idx, cvals in enumerate(list(vals)):
         offset = np.random.randn(len(cvals)) * 0.05
@@ -2453,12 +2461,21 @@ def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation
     ax = plt.gca()
     ax.set_xticks(np.arange(len(labels)) + 1)
     ax.set_xticklabels(labels, **xlabel_params)
-    plt.xlabel(group_field)
-    plt.ylabel(value_field)
+    if show_labels:
+        plt.xlabel(group_field)
+        plt.ylabel(value_field)
+
+    for idx1, clab1 in enumerate(labels):
+        for idx2, clab2 in enumerate(labels):
+            if idx1 >= idx2:
+                continue
+            cstat = scipy.stats.mannwhitneyu(vals[idx1], vals[idx2],alternative='two-sided')[1]
+            print('Mann-Whitney pval: %s - %s : %e' % (clab1, clab2, cstat))
 
     if show_stats:
         if len(labels) == 2:
             plt.title('Mann-Whitney: %s' % scipy.stats.mannwhitneyu(vals[0], vals[1])[1])
+    plt.tight_layout()
     return labels, vals, f
 
 
