@@ -352,12 +352,24 @@ def plot_violin(exp, field, features=None, downsample=True, num_keep=None, **kwa
     return fig
 
 
-def splot(exp, field, **kwargs):
+def splot(exp, field=None, gui='qt5', **kwargs):
     '''
     Plot a sorted version of the experiment exp based on field
+
+    Parameters
+    ----------
+    exp: calour.Experiment
+    field: str or None, optional
+        The field to sort by. If None, skip the sorting
+    gui: str, optional
+        The gui to use for plotting. 'qt5' for qt5 gui, 'jupyter' for jupyter notebook, 'cli' for non-interactive
+    **kwargs: additional parameters to pass to the calour.Experiment.plot() function
     '''
-    tt = exp.sort_samples(field)
-    res = tt.plot(sample_field=field, gui='qt5', **kwargs)
+    if field is not None:
+        tt = exp.sort_samples(field)
+        res = tt.plot(sample_field=field, gui=gui, **kwargs)
+    else:
+        res = tt.plot(gui='qt5', **kwargs)
     return res
 
 
@@ -612,7 +624,8 @@ def add_taxonomy(exp):
 
 def plot_experiment_terms(exp, weight='binary', min_threshold=0.005, show_legend=False, sort_legend=True):
     '''Plot the distribution of most common terms in the experiment
-    Using the dbbact annotations. For each sequence, take the strongest term (based on f-score) and plot the
+    Using the dbbact annotations.
+    For each sequence, take the strongest term (based on f-score) and plot the
     distribution of such terms for the entire set of sequences in the experiment
 
     Parameters
@@ -1926,7 +1939,23 @@ def bicluster_enrichment(exp, cluster_method='std', min_prevalence=0.05, std_thr
     return exp_list, e, dd
 
 
-def bicluster_analysis(exp, min_prevalence=0.2, include_subsets=True):
+def bicluster_analysis(exp, min_prevalence=0.2, include_subsets=True, num_iterations=100):
+    '''Perform multiple biclustring iterations and identify non-identical clusters
+    Then perform term (feature) and metadata (sample) enrichment analysis for each bicluster
+    
+    Parameters
+    ----------
+    exp: calour.AmpliconExperiment
+    min_prevalence: float or None, optional
+        if not None, keep only features with prevalence >= min_prevalence (before the biclustering)
+    include_subset: bool, optional
+    num_iterations: int, optional
+        the number of biclustering iterations to perform (each iteration can fail)
+    
+    Returns
+    -------
+
+    '''
     clusters = []
     cluster_exps = []
     exp = exp.copy()
@@ -1942,7 +1971,7 @@ def bicluster_analysis(exp, min_prevalence=0.2, include_subsets=True):
     use_exps = [exp]
 
     # find biclusters
-    for i in range(100):
+    for i in range(num_iterations):
         cexp = use_exps[np.random.randint(len(use_exps))]
         print(cexp)
         # res = bicluster(cexp, cluster_method='barkai', transform='binarydata', max_iterations=20, start_axis='f', subset=None)
@@ -2099,12 +2128,15 @@ def health_index(exp, method=None, bad_features=None, good_features=None, field_
 
     newexp.sparse = False
 
-    # the epsilon to add in case we get 0 bacteria in the good or bad groups
+    # the epsilon to add in case we get 0 bacteria in the good or bad groups   
+    # in case we use binary or no transform method, we use eps=1 since this is the relevant scale
     eps = 0.1
+
     if method is None:
         eps = 1
     elif method == 'binarydata':
         newexp.data = (newexp.data > 0)
+        eps = 1
     elif method == 'rankdata':
         newexp.data = scipy.stats.rankdata(newexp.data, axis=0)
     elif method == 'rankdata2':
@@ -2122,6 +2154,9 @@ def health_index(exp, method=None, bad_features=None, good_features=None, field_
     good_score = good_exp.data.sum(axis=1)
     logger.info('found %d bad, %d good' % (len(bad_exp.feature_metadata), len(good_exp.feature_metadata)))
     # we do "-" so high is healthy
+    print('bad_score', bad_score)
+    print('good_score', good_score)
+    print('eps', eps)
     if use_features == 'both':
         dbi = np.log2((good_score + eps) / (bad_score + eps))
     elif use_features == 'disease':
@@ -2323,9 +2358,10 @@ def variance_stat(data, labels):
 
 
 def group_dependece(exp: ca.Experiment, field, method='variance', transform=None,
-                    numperm=1000, alpha=0.1, fdr_method='dsfdr', random_seed=None):
+                    numperm=1000, alpha=0.1, fdr_method='dsfdr', random_seed=None, pair_field=None):
     '''Find features with non-random group distribution based on within-group variance
 
+    Used for example for identifying within-family conserved ASVs (in an experiment with many families)
     The permutation based p-values and multiple hypothesis correction is implemented.
 
     Parameters
@@ -2362,6 +2398,9 @@ def group_dependece(exp: ca.Experiment, field, method='variance', transform=None
         If int, random_seed is the seed used by the random number generator;
         If Generator instance, random_seed is set to the random number generator;
         If None, then fresh, unpredictable entropy will be pulled from the OS
+    pair_field: str or None, optional
+        if not None, this field is used for the random shuffle pairing. Labels are permuted only within samples sharing the same value of pair_field
+        if None, permute labels of all samples
 
     Returns
     -------
@@ -2400,14 +2439,61 @@ def group_dependece(exp: ca.Experiment, field, method='variance', transform=None
         raise ValueError('method %s not supported' % method)
 
     # find the significant features
-    keep, odif, pvals, qvals = ca.dsfdr.dsfdr(data, labels, method=method, transform_type=transform, alpha=alpha, numperm=numperm, fdr_method=fdr_method, random_seed=random_seed)
+    if pair_field is None:
+        keep, odif, pvals, qvals = ca.dsfdr.dsfdr(data, labels, method=method, transform_type=transform, alpha=alpha, numperm=numperm, fdr_method=fdr_method, random_seed=random_seed)
+    else:
+        logger.info('Preparing paired permutation for field %s' % pair_field)
+        # drop values with < 2 samples (across pair field)
+        drop_values = []
+        for cval, cexp in exp.iterate(field):
+            if len(cexp.sample_metadata) < 2:
+                logger.debug('Value %s has only %d samples. dropped' % (cval, len(cexp.sample_metadata)))
+                drop_values.append(cval)
+        if len(drop_values) > 0:
+            logger.info('Dropping %d values with < 2 samples' % len(drop_values))
+            exp = exp.filter_samples(field, drop_values, negate=True)
+
+        if len(exp.sample_metadata) == 0:
+            raise ValueError('No samples with >1 value in pair field left')
+        logger.info('%d samples left after removing group value singletons' % len(exp.sample_metadata))
+
+        # create the groups list for the shuffle function
+        groups = defaultdict(list)
+        for pos, (idx, crow) in enumerate(exp.sample_metadata.iterrows()):
+            groups[crow[pair_field]].append(pos)
+        logger.debug('total %d values for pair field' % (len(groups)))
+        for cg in groups:
+            logger.debug('value %s has %d samples' % (cg, len(groups[cg])))
+        if transform == 'pair_rank':
+            # copy so we don't change the original experiment
+            exp = exp.copy()
+            # make all pairs to 0/1 (low/high) for each feature
+            exp.sparse = False
+            for cval in exp.sample_metadata[pair_field].unique():
+                cpos = np.where(exp.sample_metadata[pair_field] == cval)[0]
+                cdat = exp.data[cpos, :]
+                exp.data[cpos, :] = scipy.stats.rankdata(cdat, axis=0)
+            # no need to do another transform in diff_abundance
+            transform = None
+
+        # create the numpy.random.Generator for the paired shuffler
+        rng = np.random.default_rng(random_seed)
+
+        def _pair_shuffler(labels, rng=rng, groups=groups):
+            clabels = labels.copy()
+            for cgroup in groups.values():
+                clabels[cgroup] = rng.permutation(clabels[cgroup])
+            return clabels
+
+        keep, odif, pvals, qvals = ca.dsfdr.dsfdr(data, labels, method=method, transform_type=transform, alpha=alpha, numperm=numperm, fdr_method=fdr_method, random_seed=random_seed, shuffler=_pair_shuffler)
+
     logger.info('Positive dependent features : %d. Negative dependent features : %d. total %d'
                 % (np.sum(odif[keep] > 0), np.sum(odif[keep] < 0), np.sum(keep)))
     newexp = ca.analysis._new_experiment_from_pvals(cexp, exp, keep, odif, pvals, qvals)
     return newexp
 
 
-def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation': 90}, colors=None, show_stats=False, show_labels=True, figsize=None):
+def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation': 90}, colors=None, show_stats=False, show_labels=True, figsize=None, yscale_factor=None):
     '''Draw a violin plot for metadata distribution (numeric) between different metadata categories (categorical)
     The plot shows a violin plot and the points (with random x jitter)
 
@@ -2428,6 +2514,8 @@ def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation
         If True, show the axis labels
     figsize: None or tuple of int, optional
         the figure size (if None, use default)
+    yscale_factor: float or None, optional
+        if not None, the factor to multiply the y axis by (to make the violin plots smaller)
 
     Returns
     -------
@@ -2458,7 +2546,13 @@ def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation
             plt.plot(offset + idx + 1, cvals, '.')
         else:
             plt.plot(offset + idx + 1, cvals, '.', c=colors[idx])
+    
     ax = plt.gca()
+
+    # set the y axis scale
+    if yscale_factor is not None:
+        ax.set_ylim(ax.get_ylim()[0], ax.get_ylim()[1] * yscale_factor)
+
     ax.set_xticks(np.arange(len(labels)) + 1)
     ax.set_xticklabels(labels, **xlabel_params)
     if show_labels:
@@ -2518,3 +2612,33 @@ def exp_from_fasta(file1, file2, group_names=['s1', 's2']):
     exp = ca.AmpliconExperiment(data=data, feature_metadata=fmd, sample_metadata=smd, sparse=False)
     dd = exp.diff_abundance('_sample_id', group_names[0], group_names[1], alpha=1)
     return dd
+
+
+def add_taxonomy_from_local(exp, tax_file='~/databases/sheba-seqs/sheba-seqs.txt', inplace=False):
+    '''Add taxonomy to an experiment from a local ASV->taxonomy file.
+    This is useful instead of re-running the taxonomy assignment
+
+    Parameters
+    ----------
+    exp: calour.AmpliconExperiment
+    tax_file: str, optional
+        The path to the sheba taxonomy file (default: ~/databases/sheba-seqs/sheba-seqs.txt)
+        File should be tab delimited with first column being the ASV id and a column named Taxon with the taxonomy
+
+    Returns
+    -------
+    exp: calour.AmpliconExperiment
+        The experiment with the taxonomy added to the feature_metadata ('taxonomy' column)
+    '''
+    if not inplace:
+        exp = exp.copy()
+
+    tax_table=pd.read_csv(tax_file,sep='\t',index_col='Feature_ID')
+    logger.info('Loaded taxonomy table from file %s, containing %d entries' % (tax_file, len(tax_table)))
+    fmd = exp.feature_metadata
+    # join the two dataframes
+    fmd = fmd.join(tax_table, how='left')
+    # rename the column Taxon to taxonomy
+    fmd.rename(columns={'Taxon':'taxonomy'}, inplace=True)
+    exp.feature_metadata = fmd
+    return exp
