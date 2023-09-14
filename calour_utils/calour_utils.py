@@ -369,7 +369,7 @@ def splot(exp, field=None, gui='qt5', **kwargs):
         tt = exp.sort_samples(field)
         res = tt.plot(sample_field=field, gui=gui, **kwargs)
     else:
-        res = tt.plot(gui='qt5', **kwargs)
+        res = tt.plot(gui=gui, **kwargs)
     return res
 
 
