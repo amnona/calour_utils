@@ -2154,9 +2154,6 @@ def health_index(exp, method=None, bad_features=None, good_features=None, field_
     good_score = good_exp.data.sum(axis=1)
     logger.info('found %d bad, %d good' % (len(bad_exp.feature_metadata), len(good_exp.feature_metadata)))
     # we do "-" so high is healthy
-    print('bad_score', bad_score)
-    print('good_score', good_score)
-    print('eps', eps)
     if use_features == 'both':
         dbi = np.log2((good_score + eps) / (bad_score + eps))
     elif use_features == 'disease':
@@ -2325,7 +2322,7 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
             cv1 = md[md[cfield] == vals[0]]
             cv2 = md[md[cfield] == vals[1]]
             cres = scipy.stats.mannwhitneyu(cv1[value_field], cv2[value_field], alternative='two-sided')
-            names.append('BIN: %s: %s (%d, %f), %s (%d, %f) %s' % (cfield, vals[0], len(cv1), np.median(cv1[value_field]), vals[1], len(cv2), np.median(cv2[value_field]), cres))
+            names.append('BIN: %s: %s (samples: %d, median: %f), %s (samples: %d, median: %f), Mann-Whitney: %s' % (cfield, vals[0], len(cv1), np.median(cv1[value_field]), vals[1], len(cv2), np.median(cv2[value_field]), cres))
             ccres = np.median(cv1[value_field]) - np.median(cv2[value_field])
         else:
             logger.debug('no values for field %s' % cfield)
@@ -2493,6 +2490,30 @@ def group_dependece(exp: ca.Experiment, field, method='variance', transform=None
     return newexp
 
 
+def plot_category_correlation(exp, metadata_field1, metadata_field2):
+    '''Plot the correlation between 2 metadata fields
+
+    Parameters
+    ----------
+    exp: calour.Experiment
+    metadata_field1: str
+        the first (x-axis) metadata field to plot (continuous)
+    metadata_field2: str
+        the second (y-axis) metadata field to plot (continuous)
+
+    Returns
+    -------
+    f: matplotlib.figure
+        the figure
+    '''
+    f = plt.figure()
+    plt.plot(exp.sample_metadata[metadata_field1], exp.sample_metadata[metadata_field2], '.')
+    plt.xlabel(metadata_field1)
+    plt.ylabel(metadata_field2)
+    res= scipy.stats.spearmanr(exp.sample_metadata[metadata_field1], exp.sample_metadata[metadata_field2],nan_policy='omit')
+    print(res)
+    return f
+
 def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation': 90}, colors=None, show_stats=False, show_labels=True, figsize=None, yscale_factor=None):
     '''Draw a violin plot for metadata distribution (numeric) between different metadata categories (categorical)
     The plot shows a violin plot and the points (with random x jitter)
@@ -2641,4 +2662,21 @@ def add_taxonomy_from_local(exp, tax_file='~/databases/sheba-seqs/sheba-seqs.txt
     # rename the column Taxon to taxonomy
     fmd.rename(columns={'Taxon':'taxonomy'}, inplace=True)
     exp.feature_metadata = fmd
+    return exp
+
+
+def freq_to_metadata(exp, sequence, col_name='seq_freq'):
+    '''Add values of a given sequence to the sample_metadata
+    
+    Parameters
+    ----------
+    exp: calour.AmpliconExperiment
+    sequence: str
+        The sequence to add to the sample_metadata
+    col_name: str, optional
+        The name of the column to add to the sample_metadata (default: 'seq_freq')
+    '''
+    data=exp.get_data(sparse=False,copy=True)
+    cdat=data[:,exp.feature_metadata.index.get_loc(sequence)]
+    exp.sample_metadata['seq_freq'] = cdat
     return exp
