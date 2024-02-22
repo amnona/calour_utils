@@ -19,6 +19,8 @@ from IPython.display import display
 import calour as ca
 from calour.util import _to_list
 from calour.training import plot_scatter
+from calour.transforming import log_n, standardize
+from calour.manipulation import chain
 
 try:
     # get the logger config file location
@@ -2255,7 +2257,7 @@ def plot_sample_term_scatter(exp, term1, term2, ignore_exp=True, transform='rank
     plt.title(transform)
 
 
-def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_values=[], filter_na=True):
+def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_values=[], filter_na=True, printit=True, plotit=True):
     '''Test correlation/enrichment between sample metadata columns and a given value_field which is a sample metadata column (e.g. _health_index following cu.health_index() ).
     Enrichment is performed on categorical metadata fields (comparing mann-whitney of value_field in the groups)
     Correlation is performed on numeric metadata fields (spearman of value field and the metadata fields)
@@ -2273,19 +2275,28 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
         values to not include in the testing (e.g. 'unknwon')
     filter_na: bool, optional
         True to remove samples with nan in their metadata field
+    printit: bool, optional
+        True to print the summary of the results (for the significant fields)
+    plotit: bool, optional
+        True to plot a barplot of the significant fields
 
     Returns
     -------
-    fields
-    stats
-    q (corrected p-values)
-    names
+    fields: list of str
+        the names of the metadata fields tested
+    stats: numpy.array of float
+        the statistics (correlation or mann-whitney) for each field
+    q (corrected p-values): numpy.array of float
+        the FDR corrected p-values for each field
+    names: list of str
+        the summary strings for each field tested
     '''
     amd = exp.sample_metadata.copy()
     names = []
     pvals = []
     fields = []
     stats = []
+    bnames =  []
     num_skipped = 0
     if ok_columns is None:
         ok_columns = amd.columns
@@ -2305,25 +2316,28 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
             num_skipped += 1
             continue
         if len(md[cfield].unique()) >= 3:
-            # print('>=3 values for field %s' % cfield)
+            # do correlation if it is numeric. otherwise error
             if not pd.to_numeric(md[cfield], errors='coerce').notnull().all():
                 num_skipped += 1
                 logger.debug('field %s is not numeric and contains >= 3 unique values. skipping' % cfield)
                 continue
-            if len(md) < 10:
+            # need at least 10 entries for correlation
+            if len(md[cfield]) < 10:
                 pass
                 # continue
             cres = scipy.stats.spearmanr(md[value_field], md[cfield])
             names.append('COR: (%d) %s: %s' % (len(md), cfield, cres))
+            bnames.append(cfield)
             ccres = cres[0]
         elif len(md[cfield].unique()) == 2:
-            # print('2 values for field %s' % cfield)
+            # 2 values so lets do mann-whitney
             vals = sorted(md[cfield].unique())
             cv1 = md[md[cfield] == vals[0]]
             cv2 = md[md[cfield] == vals[1]]
             cres = scipy.stats.mannwhitneyu(cv1[value_field], cv2[value_field], alternative='two-sided')
             names.append('BIN: %s: %s (samples: %d, median: %f), %s (samples: %d, median: %f), Mann-Whitney: %s' % (cfield, vals[0], len(cv1), np.median(cv1[value_field]), vals[1], len(cv2), np.median(cv2[value_field]), cres))
             ccres = np.median(cv1[value_field]) - np.median(cv2[value_field])
+            bnames.append(cfield+':'+str(vals[0]))
         else:
             logger.debug('no values for field %s' % cfield)
             num_skipped += 1
@@ -2337,10 +2351,41 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
         logger.error('no fields with matching values detected')
         return [], [], [], []
     reject, q, aaa, bbb = multipletests(pvals, alpha=alpha, method='fdr_bh')
-    # reject, q = statsmodels.stats.multitest.fdrcorrection(pvals,alpha=alpha,method='indep')
-    for idx, cname in enumerate(names):
-        if reject[idx]:
-            print(cname)
+    if printit:
+        for idx, cname in enumerate(names):
+            if reject[idx]:
+                print(cname)
+    if plotit:
+        # create a horizontal bar plot of the top 10 positive and negative stats with q-value<alpha
+        q = np.array(q)
+        stats = np.array(stats)        
+        fields = np.array(fields)
+        names = np.array(names)
+        bnames = np.array(bnames)
+        idx = np.argsort(stats)
+        q = q[idx]
+        stats = stats[idx]
+        fields = fields[idx]
+        bnames = bnames[idx]
+        names = names[idx]
+        qpos = np.where((q < alpha) & (stats > 0))[0]
+        if len(qpos)>10:
+            qpos = qpos[-10:]
+        qneg = np.where((q < alpha) & (stats < 0))[0]
+        if len(qneg)>10:
+            qneg = qneg[:10]
+        q_plot = np.hstack([q[qneg], q[qpos]])
+        stats_plot = np.hstack([stats[qneg], stats[qpos]])
+        # fields_plot = np.hstack([fields[qneg], fields[qpos]])
+        fields_plot = np.hstack([bnames[qneg], bnames[qpos]])
+        colors = ['red' if x < 0 else 'green' for x in stats_plot]
+        plt.figure()
+        plt.barh(np.arange(len(q_plot)), stats_plot, color=colors)
+        plt.yticks(np.arange(len(q_plot)), fields_plot)
+        plt.xlabel('Correlation')
+        plt.xlim([-1, 1])
+
+
     return fields, np.array(stats), np.array(q), names
 
 
@@ -2679,4 +2724,603 @@ def freq_to_metadata(exp, sequence, col_name='seq_freq'):
     data=exp.get_data(sparse=False,copy=True)
     cdat=data[:,exp.feature_metadata.index.get_loc(sequence)]
     exp.sample_metadata['seq_freq'] = cdat
+    return exp
+
+
+def get_annotation_enrichment(dd):
+    '''Get the per-annotation f-scores for the differential abundance result experiment dd
+
+    Parameters
+    ----------
+    dd : calour.AmpliconExperiment
+        The experiment with the differential abundance results
+    
+    Returns
+    -------
+    (sorted by the absolute difference between the f-scores of the 2 groups)
+
+    af1 : np.array of float
+        The f-score for each annotation in the first group
+    af2 : np.array of float
+        The f-score for each annotation in the second group
+    ids : np.array of str
+        The annotation ids
+    annos : list of dict
+        The annotation
+    '''
+    db = ca.database._get_database_class('dbbact')
+    db.add_all_annotations_to_exp(dd)
+    s1=dd.feature_metadata.loc[dd.feature_metadata['_calour_stat']<0].index.values
+    s2=dd.feature_metadata.loc[dd.feature_metadata['_calour_stat']>0].index.values
+    af1=[]
+    af2=[]
+    ids=[]
+    for cid, canno in dd.databases['dbbact']['annotations'].items():
+        ns1=0
+        for cseq in s1:
+            if cid in dd.databases['dbbact']['sequence_annotations'][cseq]:
+                ns1 += 1
+        ns2=0
+        for cseq in s2:
+            if cid in dd.databases['dbbact']['sequence_annotations'][cseq]:
+                ns2 += 1
+        recall1=ns1/canno['num_sequences']
+        recall2=ns2/canno['num_sequences']
+        prec1=ns1/len(s1)
+        prec2=ns2/len(s2)
+        f1=2*prec1*recall1/(prec1+recall1+1)
+        f2=2*prec2*recall2/(prec2+recall2+1)
+        af1.append(f1)
+        af2.append(f2)
+        ids.append(cid)
+        
+    si1=np.argsort(np.abs(np.array(af1)-np.array(af2)))[::-1]
+    af1=np.array(af1)[si1]
+    af2=np.array(af2)[si1]
+    ids=np.array(ids)[si1]
+
+    return af1, af2, ids, [dd.databases['dbbact']['annotations'][x] for x in ids]
+    
+
+def plot_annotation_enrichment(dd, **kwargs):
+    '''Plot the annotation enrichment for the differential abundance result experiment dd
+    Using the combined sequences f-score for each annotation
+
+    Parameters
+    ----------
+    dd : calour.AmpliconExperiment
+        The experiment with the differential abundance results
+    **kwargs:
+        additional arguments for dd.plot_enrichment(). These include:
+    max_show: int or (int, int) or None, optional
+        The maximal number of terms to show
+        if None, show all terms
+        if int, show at most the max_show maximal positive and negative terms
+        if (int, int), show at most XXX maximal positive and YYY maximal negative terms
+    ax: matplotlib.axes.Axes or None, optional
+        The axes to which to plot the figure. None (default) to create a new figure
+    lables: tuple of (str, str) or None (optional)
+        name for terms enriched in group1 or group2 respectively, or None to not show legend
+    colors: tuple of (str, str) or None (optional)
+        Colors for terms enriched in group1 or group2 respectively
+    labels_kwargs: dict, optional
+        Additional parameters for the axis ticks labels fonts. See matplolib.axes.Axes.set_yticklabels()
+    numbers_kwargs: dict or None, optional
+        Additional parameters for the number of enriched experiments labels (inside the bars) fonts. See matplolib.axes.Axes.text(). If None do not display the number of enriched experiments
+
+    Returns
+    -------
+    f : matplotlib.figure
+        The figure
+    '''
+    db=ca.database._get_database_class('dbbact')
+    # get the labels for the 2 groups if available
+    if 'labels' in kwargs:
+        # pop the labels from kwargs so we don't pass them to dd.plot_enrichment
+        labels=kwargs.pop('labels')
+    else:
+        if '_calour_direction' in dd.feature_metadata.columns:
+            label1=dd.feature_metadata.loc[dd.feature_metadata['_calour_stat']<0,'_calour_direction'].iloc[0]
+            label2=dd.feature_metadata.loc[dd.feature_metadata['_calour_stat']>0,'_calour_direction'].iloc[0]
+            labels=[label1,label2]
+        else:
+            labels=['group1','group2']
+    res=get_annotation_enrichment(dd)
+    pp=pd.DataFrame(res[0]-res[1],index=[db.db.get_annotation_string(x) for x in res[3]],columns=['odif'])
+    pp['term']=pp.index.values
+    ax=dd.plot_enrichment(pp,labels=labels)
+    return ax
+
+
+def compare_diff_abundance_to_not_significant(exp,field,val1,val2=None,alpha=0.1, prevalence_percentile=10):
+    '''Compare the differential abundance of val1 to val2 in field in exp to the rest of the features
+
+    Parameters
+    ----------
+    exp : AmpliconExperiment
+        The experiment to compare
+    field : str
+        The field to compare
+    val1 : str
+        The value to compare
+    val2 : str
+        The value to compare
+    alpha : float
+        The FDR cutoff for significance
+    prevalence_percentile : float
+        The percentile of the diff_abundance ASV prevalence to use as a threshold for filtering the non-significant features
+
+    Returns
+    -------
+    '''
+    dd=exp.diff_abundance(field,val1,val2,alpha=alpha)
+    if len(dd.feature_metadata)==0:
+        print('no significant features')
+        return
+    dd.plot_diff_abundance_enrichment(ignore_exp=True)
+    # get the ids of the significant features in each _calour_direction
+    directions=dd.feature_metadata['_calour_direction'].unique()
+    d1=dd.feature_metadata.loc[dd.feature_metadata['_calour_direction']==directions[0]].index.values
+    d2=dd.feature_metadata.loc[dd.feature_metadata['_calour_direction']==directions[1]].index.values
+    notsig=exp.filter_ids(dd.feature_metadata.index.values,negate=True)
+    print('found %d higher in %s, %d higher in %s, %d not significant' % (len(d1),val1,len(d2),val2,len(notsig.feature_metadata)))
+    prev_thresh=np.percentile(dd.get_data(sparse=False).sum(axis=0), prevalence_percentile) / exp.sample_metadata.shape[0]
+    print('using prevalence threshold of %f' % prev_thresh)
+    notsig=notsig.filter_prevalence(prev_thresh)
+    print('after filtering by prevalence, %d not significant' % len(notsig.feature_metadata))
+
+    uu=notsig.diff_abundance(field,val1,val2,alpha=1)
+    uud1 = uu.feature_metadata.loc[uu.feature_metadata['_calour_direction']==directions[0]].index.values
+    uud2 = uu.feature_metadata.loc[uu.feature_metadata['_calour_direction']==directions[1]].index.values
+    print('*** from nonsignificant, found %d higher in %s, %d higher in %s' % (len(uud1),val1,len(uud2),val2))
+
+
+    # create new experiment with ids from d1 and notsig
+    # qq=exp.filter_ids(np.append(d1,notsig.feature_metadata.index.values))
+    qq=exp.filter_ids(np.append(d1,uud1))
+    # create a qq.feature_metadata column named _calour_direction and put directions[0] in the ids from d1, "_not_significant" in the rest
+    qq.feature_metadata['_calour_direction']='not_significant'
+    qq.feature_metadata.loc[d1,'_calour_direction']=directions[0]
+    # put 1 in all qq.feature_metadata['_calour_stat'] values where _calour_direction is directions[0]
+    qq.feature_metadata['_calour_stat']=-1
+    qq.feature_metadata.loc[qq.feature_metadata['_calour_direction']==directions[0],'_calour_stat']=1
+    # plot term enrichment
+    f,dif=qq.plot_diff_abundance_enrichment(ignore_exp=True)
+
+    # create new experiment with ids from d2 and notsig
+    # qq2=exp.filter_ids(np.append(d2,notsig.feature_metadata.index.values))
+    qq2=exp.filter_ids(np.append(d2,uud2))
+    # create a qq.feature_metadata column named _calour_direction and put directions[1] in the ids from d2, "_not_significant" in the rest
+    qq2.feature_metadata['_calour_direction']='not_significant'
+    qq2.feature_metadata.loc[d2,'_calour_direction']=directions[1]
+    # put 1 in all qq.feature_metadata['_calour_stat'] values where _calour_direction is directions[0]
+    qq2.feature_metadata['_calour_stat']=-1
+    qq2.feature_metadata.loc[qq2.feature_metadata['_calour_direction']==directions[1],'_calour_stat']=1
+    # plot term enrichment
+    f2,dif2=qq2.plot_diff_abundance_enrichment(ignore_exp=True)
+    return dd,dif,dif2
+
+
+def plot_term_fscores_per_bacteria(terms,exp,field,val1,val2=None,alpha=0.25):
+    '''plot f-score distribution for bacteria associated with val1 and val2 in field or not associated with any of them
+
+    Parameters
+    ----------
+    terms : list of str
+        the terms to test
+    exp : AmpliconExperiment
+        the experiment to test
+    field : str
+        the field to test
+    val1 : str
+        the field value for group1
+    val2 : str
+        the field value for group2
+    alpha : float
+        the FDR cutoff for significance (NOTE: we use FDR=0.5 for the non-significant features)
+    '''
+    db=ca.database._get_database_class('dbbact')
+
+    exp=exp.filter_prevalence(0.1)
+    dd=exp.diff_abundance(field,val1,val2,alpha=alpha)
+    if len(dd.feature_metadata)==0:
+        print('no significant features')
+        return
+    dd2=exp.diff_abundance(field,val1,val2,alpha=0.5)
+    print('*** found %d significant features' % len(dd.feature_metadata))
+    print('after prevalence filtering: %d features' % len(exp.feature_metadata))
+    for cseq in exp.feature_metadata.index.values:
+        if cseq not in dd2.feature_metadata.index.values:
+            exp.feature_metadata.loc[cseq,'dd_type']='not_significant'
+        else:
+            exp.feature_metadata.loc[cseq,'dd_type']='na'
+    # set the 'type' field for datc.feature_metadata to be 'good' for all indices that have 'HT' tt.feature_metadata._calour_direction
+    for cseq in dd.feature_metadata.index.values:
+        if cseq not in exp.feature_metadata.index.values:
+            continue
+        if dd.feature_metadata._calour_direction[cseq]==val1:
+            exp.feature_metadata.loc[cseq,'dd_type']=val1
+        else:
+            exp.feature_metadata.loc[cseq,'dd_type']=val2
+
+    print(exp.feature_metadata.dd_type.value_counts())
+    res=db.get_exp_feature_stats(exp)
+
+    for term in terms:
+        scores={}
+        for cseq,cres in res.items():
+            cfscore=cres['fscore'].get(term,0)
+            scores[cseq]=cfscore
+        v1exp=exp.filter_by_metadata('dd_type',[val1],axis='f')
+        v2exp=exp.filter_by_metadata('dd_type',[val2],axis='f')
+        notsigexp=exp.filter_by_metadata('dd_type',['not_significant'],axis='f')
+
+        scoresv1=[scores.get(x,0) for x in v1exp.feature_metadata.index.values]
+        scoresv2=[scores.get(x,0) for x in v2exp.feature_metadata.index.values]
+        scoresnotsig=[scores.get(x,0) for x in notsigexp.feature_metadata.index.values]
+
+        f=plt.figure()
+        plt.scatter(np.zeros(len(scoresv1)),scoresv1,c='g')
+        plt.scatter(np.ones(len(scoresv2)),scoresv2,c='r')
+        plt.scatter(np.ones(len(scoresnotsig))+1,scoresnotsig,c='k')
+        plt.violinplot([scoresv1, scoresv2,scoresnotsig],positions=[0,1,2],showmeans=True)
+        pv=scipy.stats.mannwhitneyu(scoresv1,scoresv2)
+        plt.title('%s: good=%f, bad=%f, pv: %f' % (term,np.median(scoresv1),np.median(scoresv2),pv[1]))
+        ax=plt.gca()
+        ax.set_xticks([0,1,2])
+        ax.set_xticklabels([val1,val2,'ns'],rotation=90)
+
+
+def diff_abundance_enrichment(exp, **kwargs):
+    # get the positive effect features
+    positive = exp.feature_metadata['_calour_stat'] > 0
+    positive = exp.feature_metadata.index.values[positive.values]
+    enriched, term_features, featZures = exp.enrichment(features=positive, dbname='dbbact', **kwargs)
+    return enriched
+
+def cluster_and_enrichment(exp, num_test=10,seqs=None,cluster_iterations=10,alpha=0.25,metadata_alpha=0.25):
+    '''Identify clusters of bacteria by correlation to a bacteria, and calculate sample metadata and dbBact enrichment fot the clusters
+    
+    Paramaters
+    ----------
+    exp : AmpliconExperiment
+        the experiment to test
+    num_test : int, optional
+        the number of bacteria to test (default: 10) (if seqs is not None, ignore this parameter)
+    seqs : list of str or None, optional
+        the sequences to test (if None, select num_test random sequences)
+    cluster_iterations : int, optional
+        the number of iterations to perform for the iterative correlation (default: 10)
+    alpha : float, optional
+        the FDR cutoff for feature correlation significance (default: 0.25)
+    metadata_alpha : float, optional
+        the FDR cutoff for sample metadata enrichment significance (default: 0.25)
+    
+    Returns
+    -------
+    func_res: dict {sequence(str): {'exp': AmpliconExperiment, 'metadata': [enriched_fields:str]}]
+        exp: the experiment with the correlated/anti-correlated sequences (feature_metadata field 'cor_cluster')
+        metadata: the enriched metadata fields for the cluster
+        'allexp': AmpliconExperiment with correlated/not-correlated bacteria (feature_metadata field '_calour_direction' = 'correlated'/)
+    '''
+    tt=exp.copy()
+    tt.sparse=False
+    func_res = {}
+
+    found_clusters=[]
+    ignore_bact=set()
+    tt.sample_metadata['cor_cluster']=0
+    clusters_exp={}
+    clusters={}
+    clusters_res={}
+    # if no sequences provided, select num_test random sequences
+    if seqs is None:
+        print('*** no sequences provided - selecting %d random sequences' % num_test)
+        seqs=np.random.choice(tt.feature_metadata.index.values,num_test,replace=False)
+
+    for cseq in seqs:
+        print('---------------------------------------------------------')
+        pos=tt.feature_metadata.index.get_loc(cseq)
+        ee=tt.copy()
+        # ee=tt.sort_abundance()
+        if 'Taxon' in ee.feature_metadata.columns:
+            print(ee.feature_metadata.Taxon[pos])
+        ss=ee.feature_metadata.index[pos]
+        print(ss)
+        func_res[ss]={}
+        ee=sort_by_bacteria(ee,ss)
+        ee.sample_metadata['ttt']=ee.data[:,pos]
+        iter_ee = ee.copy()
+        # ee=ee.filter_ids(list(ignore_bact),negate=True)
+
+        # find the bacteria correlated/anti-correlated with this bacteria
+        ee=ee.correlation('ttt',alpha=alpha)
+        if len(ee.feature_metadata)==0:
+            print('no correlated bacteria found')
+            continue
+
+        # do iterative correlations on the cluster
+        ca.set_log_level('ERROR')
+        for citer in range(cluster_iterations):
+            # print('iteration %d' % citer)
+            ee=iter_ee.correlation('ttt',alpha=alpha)
+            cor_pos = ee.filter_by_metadata('_calour_direction',['ttt'],axis='f')
+            if len(cor_pos.feature_metadata)==0:
+                print('no correlated bacteria found in iteration %d' % citer)
+                break
+            data_cor=chain(cor_pos, steps=[log_n, standardize],standardize__axis=1).get_data(sparse=False).T
+            iter_ee.sample_metadata['ttt']=np.mean(data_cor,axis=0)
+            # print('found %d correlated bacteria' % len(cor_pos.feature_metadata))
+        ca.set_log_level('INFO')
+        if len(ee.feature_metadata)==0:
+            continue
+        
+        found_overlap=False
+        cluster_seqs = set(ee.filter_by_metadata('_calour_direction',['ttt'],axis='f').feature_metadata.index.values)
+        for ccluster in found_clusters:
+            coverlap=len(ccluster.intersection(cluster_seqs))/len(cluster_seqs) 
+            if coverlap>0.9:
+                print('cluster already found overlap %f, continuing' % coverlap)
+                found_overlap=True
+                break
+        if found_overlap:
+            continue
+        found_clusters.append(cluster_seqs)
+
+        # store the experiment for the results
+        ee.feature_metadata['cor_cluster']=ee.feature_metadata['_calour_direction']
+        func_res[ss]['exp']=ee
+
+        num_correlated = len(ee.feature_metadata.loc[ee.feature_metadata['_calour_direction']=='ttt'])
+        num_anti_correlated = len(ee.feature_metadata) - num_correlated
+        print('Found %d correlated bacteria, %d anti-correlated bacteria, %d non-significant' % (num_correlated, num_anti_correlated, len(tt.feature_metadata) - (num_correlated + num_anti_correlated)))
+
+        clusters_exp[ss]=ee
+        ignore_bact=ignore_bact.union(set(ee.feature_metadata.index.values))
+
+        ee1=ee.filter_by_metadata('_calour_direction',['ttt'],axis='f')
+        data1=chain(ee1, steps=[log_n, standardize],standardize__axis=1).get_data(sparse=False).T
+
+        # now look at the anti-correlated bacteria (if present)
+        ee2=ee.filter_by_metadata('_calour_direction',['ttt'],axis='f',negate=True)
+        if len(ee2.feature_metadata)>0:
+            # normalize all the anti-correlated bacteria to the same scale (and log transform)
+            data2=chain(ee2, steps=[log_n, standardize],standardize__axis=1).get_data(sparse=False).T
+
+            # for each sample calculate the score based on the normalized correlated - anti-correlated bacteria
+            ee.sample_metadata['tttt']=np.mean(data1,axis=0)-np.mean(data2,axis=0)
+
+            # get metadata correlation for the per-sample cluster score
+            print('*********************')
+            print('metadata correlation')
+
+            res=metadata_correlation(ee,'tttt',alpha=metadata_alpha,printit=False)
+            res_dict = {}
+            for cidx, cfield in enumerate(res[0]):
+                if cfield == 'bf':
+                    continue
+                if cfield == 'ttt':
+                    continue
+                if cfield == 'tttt':
+                    continue
+                if res[2][cidx] <= 0.1:
+                    res_dict[cfield] = {'stat': res[1][cidx], 'qval': res[2][cidx], 'name': res[3][cidx]}
+            # sort the results by the stat
+            res_dict = {k: v for k, v in sorted(res_dict.items(), key=lambda item: item[1]['stat'])}
+            func_res[ss]['metadata'] = [x for x in res_dict.keys()]
+            for cfield, cres in res_dict.items():
+                print('+++ %s: stat=%f, qval=%f, %s' % (cfield, cres['stat'], cres['qval'], cres['name']))
+ 
+            print('***********************')
+            clusters_res[ss]=res
+            clusters[ss]=ee.feature_metadata.index.values
+            for cseq in ee.feature_metadata.index:
+                tt.feature_metadata.loc[cseq,'cor_cluster']=pos
+
+            # do correlated vs. anti-correlated enrichment test
+            res=diff_abundance_enrichment(ee)
+            print('*********************')
+            print('dbBact correlated vs. anti-correlated')
+            # print only the index, odif and pvals columns of the res dataframe
+            print(res.iloc[:,[1,2]])
+        else:
+            # no anti-correlated
+            # for each sample calculate the score based on the normalized correlated bacteria
+            ee.sample_metadata['tttt']=np.sum(data1,axis=0)
+
+        # now print positive correlation vs. all other sequences dbBact enrichment
+        eee=tt.copy()
+        eee.feature_metadata['_calour_direction']='not correlated'
+        eee.feature_metadata['_calour_stat']=-1
+        for x in ee.feature_metadata.index:
+            if ee.feature_metadata.loc[x,'_calour_stat']>0:
+                eee.feature_metadata.loc[x,'_calour_direction']='correlated'
+            else:
+                eee.feature_metadata.loc[x,'_calour_direction']='anti-correlated'
+            eee.feature_metadata.loc[x,'_calour_stat']=ee.feature_metadata.loc[x,'_calour_stat']
+        func_res[ss]['allexp']=eee
+        res=diff_abundance_enrichment(eee)
+        print('*********************')
+        print('dbBact correlated vs. all other')
+        print(res.iloc[:,[1,2]])
+
+    return func_res
+
+
+def cluster_sklearn(exp, method='kmeans', transform=[log_n, standardize], alpha=0.25):
+    '''Cluster the features using scikit-learn methods, and test for sample metadata and feature dbbact cluster enrichment
+    
+    Parameters:
+    -----------
+    exp : AmpliconExperiment
+        the experiment to test
+    method : str, optional
+        the clustering method to use (default: 'kmeans')
+    transform : list of functions, optional
+        the transformations to apply to the data before clustering (default: [log_n, standardize])
+    alpha : float, optional
+        the FDR cutoff for sample/feature enrichment significance (default: 0.25)
+    
+    Returns:
+    --------
+    exp: AmpliconExperiment
+        the experiment with the clustering results in the feature_metadata field '_cluster'
+    res: list of
+        cluster enrichment info
+    '''
+    from sklearn.cluster import OPTICS, KMeans, AffinityPropagation
+
+    exp = exp.copy()
+
+    if method=='kmeans':
+        clust = KMeans(n_clusters=10)
+    elif method=='optics':
+        clust = OPTICS(min_samples=5, metric='braycurtis', xi=0.01,min_cluster_size=5)
+    elif method=='affinity':
+        clust = AffinityPropagation()
+    else:
+        raise ValueError('unknown method %s' % method)
+    
+    exp=exp.filter_prevalence(0.05)
+    # data=rankdata(exp.get_data(sparse=False).T,axis=1)
+    # data=chain(exp, steps=[log_n]).get_data(sparse=False).T
+    data=chain(exp, steps=transform,standardize__axis=1).get_data(sparse=False).T
+    clust.fit(data)
+    labels = clust.labels_
+    logger.info('found %d clusters' % len(np.unique(labels)))
+
+    exp.feature_metadata['_cluster']=labels
+    exp=exp.sort_by_metadata('_cluster',axis='f')
+
+    for ccluster in np.unique(labels):
+        cluster_pos = np.where(exp.feature_metadata['_cluster'] == ccluster)[0]
+        print('***************************************** Cluster %s (%d features)' % (ccluster, len(cluster_pos)))
+        # cluster_score = np.sum(exp.data[:, cluster_pos], axis=1)
+        cluster_score = np.sum(data.T[:, cluster_pos], axis=1)
+        exp.sample_metadata['_cluster_score'] = cluster_score
+        res=metadata_correlation(exp,'_cluster_score',alpha=alpha,printit=True,plotit=True)
+        plt.title('Cluster %s (%d features)' % (ccluster, len(cluster_pos)))
+        exp.feature_metadata['_calour_direction']='cluster %s' % ccluster
+        # and set _calour_direction for all features not in cluster to 'other'
+        exp.feature_metadata.loc[exp.feature_metadata['_cluster']!=ccluster,'_calour_direction']='other'
+        exp.feature_metadata['_calour_stat']=1
+        exp.feature_metadata.loc[exp.feature_metadata['_cluster']!=ccluster,'_calour_stat']=-1
+        exp.plot_diff_abundance_enrichment(alpha=alpha)
+
+    return exp,res
+
+
+def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,method='mean'):
+    '''Create a new experiment with same samples and f-scores as features by calculating the f-scores for each feature in the experiment
+
+    Parameters
+    ----------
+    exp: calour.AmpliconExperiment
+        the experiment to plot
+    transform: str or None, optional
+        the transformation to apply to the data before calculating the f-scores.
+        Each ASV, the associated f-score is weighted by the transformed frequency of each ASV in the sample
+        options are:
+        None - no transformation
+        'percent' - convert to percent per sample (sum to 100%)
+        'binarydata' - convert the data to binary (presence/absence)
+        'rankdata' - convert the data to ranks "(within each sample)
+        'log2data' - convert the data to log2(x)
+    ignore_exp: bool, or list of int or None, optional
+        if True, ignore the current experiment
+        if None, don't ignore any experiment
+        if list of int, ignore the experiments with the given ids
+    max_id: int or list of int or None, optional
+        if int, the maximal annotationID to use for the f-scores analysis (for reproducible results ignoring new annotations)
+        if list of int, use only annotations within the list
+        if None, use all annotations
+
+    Returns
+    -------
+    calour.Experiment
+        the sample*term experiment with per-sample term f-scores as the data
+    '''
+    exp = exp.copy()
+
+    db = ca.database._get_database_class('dbbact')
+    res=db.get_exp_feature_stats(exp, ignore_exp=ignore_exp, max_id=max_id)
+    # returns dict of {feature(str): {'fscore':, 'recall':, 'precision': , 'term_count':, 'reduced_f': }}
+
+    # transform the reads count if needed
+    cdata = exp.get_data(sparse=False)
+    if transform is None:
+        pass
+    elif transform == 'percent':
+        cdata = cdata / cdata.sum(axis=1, keepdims=True) * 100
+    elif transform == 'binarydata':
+        cdata = (cdata > 0).astype(float)
+        cdata = cdata / cdata.sum(axis=1, keepdims=True)
+    elif transform == 'rankdata':
+        for ccol in range(cdata.shape[1]):
+            cdata[:, ccol] = scipy.stats.rankdata(cdata[:, ccol])
+        cdata = cdata / cdata.sum(axis=1, keepdims=True)
+    elif transform == 'log2data':
+        cdata[cdata<1] = 1
+        cdata = np.log2(cdata)
+        cdata = cdata / cdata.sum(axis=1, keepdims=True)
+    else:
+        raise ValueError('unknown transform %s' % transform)
+
+    # create the new experiment
+    # create the terms list
+    terms = set()
+    for cfeature,cres in res.items():
+        terms.update(cres['fscore'].keys())
+    logger.info('found %d terms' % len(terms))
+
+    terms = list(terms)
+    term_data = np.zeros([len(exp.sample_metadata), len(terms)])
+
+    for term_idx, cterm in enumerate(terms):
+        term_scores_vec = np.zeros([len(exp.feature_metadata)])
+        for idx, cfeature in enumerate(exp.feature_metadata.index.values):
+            cval = res.get(cfeature, {'fscore': {cterm: 0}})
+            term_scores_vec[idx] = cval['fscore'].get(cterm, 0)
+
+        if method == 'mean':        
+            term_sample_scores = np.dot(cdata, term_scores_vec) / cdata.sum(axis=1)
+        elif method == 'median':
+            raise ValueError('median method not implemented yet')
+            # term_sample_scores = np.median(cdata * term_scores_vec, axis=1)
+        else:
+            raise ValueError('unknown method %s' % method)
+        term_data[:,term_idx]=term_sample_scores
+    
+    # create a dataframe with terms as the index and the 'feauture_id' column    
+    df=pd.DataFrame(terms,columns=['feature_id'],index=terms)        
+
+    new_exp = ca.Experiment(data=term_data, sample_metadata=exp.sample_metadata, feature_metadata=df, sparse=False,description='f-scores for %s' % exp.description)
+    return new_exp
+
+def taxonomy_from_seqs_file(exp, filename='/Users/amnon/databases/sheba-seqs/sheba-seqs.txt', taxonomy_column='Taxon'):
+    '''Add taxonomy to feature based on a pre-calculated taxonomy file.
+    Uses a tsv file with the sequence in the 2nd column, and a column named "Taxon" with the taxonomy
+    
+    Parameters
+    ----------
+    exp : calour.AmpliconExperiment
+        the experiment to add the taxonomy to
+    filename : str, optional
+        the path to the taxonomy file
+    taxonomy_column : str, optional
+        the column name (in the tsv file) containing the taxonomy
+
+    Returns
+    -------
+    calour.AmpliconExperiment
+        the experiment with the taxonomy added to the feature_metadata ('Taxonomy' column)
+    '''
+    seqs_table = pd.read_csv(filename, sep='\t', index_col=1)
+    taxonomy=[]
+    for cseq in exp.feature_metadata.index.values:
+        if cseq in seqs_table.index:
+            taxonomy.append(seqs_table.loc[cseq][taxonomy_column])
+        else:
+            taxonomy.append('NA')
+    exp.feature_metadata['Taxonomy']=taxonomy
     return exp
