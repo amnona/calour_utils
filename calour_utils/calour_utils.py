@@ -2129,7 +2129,7 @@ def health_index(exp, method=None, bad_features=None, good_features=None, field_
     newexp.feature_metadata.loc[newexp.feature_metadata.index.isin(ns_bad['_feature_id']), '_health_index_group'] = 'bad'
 
     newexp.sparse = False
-
+    # return newexp
     # the epsilon to add in case we get 0 bacteria in the good or bad groups   
     # in case we use binary or no transform method, we use eps=1 since this is the relevant scale
     eps = 0.1
@@ -2272,7 +2272,7 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
     ok_columns: list of str or None, optional
         if not None, test only fields appeating in ok_columns instead of all the sample_metadata fields
     bad_values: list of str, optional
-        values to not include in the testing (e.g. 'unknwon')
+        values to not include in the testing (e.g. 'unknown')
     filter_na: bool, optional
         True to remove samples with nan in their metadata field
     printit: bool, optional
@@ -2305,16 +2305,20 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
             if cfield not in ok_columns:
                 continue
         md = amd.copy()
+
         # get rid of bad field values
         for cignore in bad_values:
             md = md[md[cfield] != cignore]
         if filter_na:
             md = md[md[cfield].notna()]
 
+        # skip fields with only 1 unique value
         if len(md[cfield].unique()) == 1:
             logger.debug('field %s contains 1 value. skipping' % cfield)
             num_skipped += 1
             continue
+
+        # if numeric and more than 2 unique values, do spearman correlation
         if len(md[cfield].unique()) >= 3:
             # do correlation if it is numeric. otherwise error
             if not pd.to_numeric(md[cfield], errors='coerce').notnull().all():
@@ -2323,20 +2327,37 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
                 continue
             # need at least 10 entries for correlation
             if len(md[cfield]) < 10:
+                logger.debug('field %s contains <10 numeric entries. skipping' % cfield)
                 pass
                 # continue
             cres = scipy.stats.spearmanr(md[value_field], md[cfield])
             names.append('COR: (%d) %s: %s' % (len(md), cfield, cres))
             bnames.append(cfield)
             ccres = cres[0]
+
         elif len(md[cfield].unique()) == 2:
             # 2 values so lets do mann-whitney
             vals = sorted(md[cfield].unique())
             cv1 = md[md[cfield] == vals[0]]
             cv2 = md[md[cfield] == vals[1]]
             cres = scipy.stats.mannwhitneyu(cv1[value_field], cv2[value_field], alternative='two-sided')
-            names.append('BIN: %s: %s (samples: %d, median: %f), %s (samples: %d, median: %f), Mann-Whitney: %s' % (cfield, vals[0], len(cv1), np.median(cv1[value_field]), vals[1], len(cv2), np.median(cv2[value_field]), cres))
-            ccres = np.median(cv1[value_field]) - np.median(cv2[value_field])
+            # also calculate the normalized (-1..1) difference
+            ranked_vals = scipy.stats.rankdata(md[value_field])
+
+            # normalize the effect size to be in the [-1:1] range (0 for random, -1 / 1 for fully ordered)
+            diff = np.median(ranked_vals[md[cfield]==vals[0]]) - np.median(ranked_vals[md[cfield]==vals[1]])
+            n_g1 = len(cv1)
+            n_g2 = len(cv2)
+            diff = diff / ((((n_g1 + 1) / 2) + n_g2) - ((n_g2 + 1) / 2))
+
+            bigger_name = vals[0] if diff > 0 else vals[1]
+            smaller_name = vals[1] if diff > 0 else vals[0]
+            bigger_name = vals[0]
+            smaller_name = vals[1]
+            names.append('BIN: %s %s vs %s (%f): %s (samples: %d, median: %f), %s (samples: %d, median: %f), Mann-Whitney: %s' % (cfield, bigger_name, smaller_name, diff, vals[0], len(cv1), np.median(cv1[value_field]), vals[1], len(cv2), np.median(cv2[value_field]), cres))
+
+            # ccres = np.median(cv1[value_field]) - np.median(cv2[value_field])
+            ccres = diff
             bnames.append(cfield+':'+str(vals[0]))
         else:
             logger.debug('no values for field %s' % cfield)
@@ -3210,7 +3231,7 @@ def cluster_sklearn(exp, method='kmeans', transform=[log_n, standardize], alpha=
     return exp,res
 
 
-def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,method='mean'):
+def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,method='mean',score_type='fscore',threshold=None, low_number_correction=0):
     '''Create a new experiment with same samples and f-scores as features by calculating the f-scores for each feature in the experiment
 
     Parameters
@@ -3234,6 +3255,20 @@ def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,meth
         if int, the maximal annotationID to use for the f-scores analysis (for reproducible results ignoring new annotations)
         if list of int, use only annotations within the list
         if None, use all annotations
+    method: str, optional
+        the method to calculate the term-sample scores
+        'mean' - calculate the mean of the term scores
+        'median' - calculate the median of the term scores
+    score_type: str, optional
+        the type of per-term score to calculate
+        'recall' - the fraction of dbBact annotations containing each sequence
+        'precision' - the fraction of sequence annotations containing the term
+        'fscore' - a combination of recall and precision: R*P/(R+P)
+        'reduced_f' - the reduced f-score of the term
+    threshold: float or None, optional
+        if not None, return only terms that are significantly enriched in the annotations compared to complete database null with p-val <= threshold
+	low_number_correction: int, optional
+		the constant to penalize low number of annotations in the precision. used as precision=obs/(total+low_number_correction)
 
     Returns
     -------
@@ -3243,7 +3278,7 @@ def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,meth
     exp = exp.copy()
 
     db = ca.database._get_database_class('dbbact')
-    res=db.get_exp_feature_stats(exp, ignore_exp=ignore_exp, max_id=max_id)
+    res=db.get_exp_feature_stats(exp, ignore_exp=ignore_exp, max_id=max_id, threshold=threshold, low_number_correction=low_number_correction)
     # returns dict of {feature(str): {'fscore':, 'recall':, 'precision': , 'term_count':, 'reduced_f': }}
 
     # transform the reads count if needed
@@ -3270,17 +3305,18 @@ def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,meth
     # create the terms list
     terms = set()
     for cfeature,cres in res.items():
-        terms.update(cres['fscore'].keys())
+        terms.update(cres[score_type].keys())
     logger.info('found %d terms' % len(terms))
 
     terms = list(terms)
     term_data = np.zeros([len(exp.sample_metadata), len(terms)])
 
+    # create the term-sample score matrix (each row is a sample, each column is a term)
     for term_idx, cterm in enumerate(terms):
         term_scores_vec = np.zeros([len(exp.feature_metadata)])
         for idx, cfeature in enumerate(exp.feature_metadata.index.values):
-            cval = res.get(cfeature, {'fscore': {cterm: 0}})
-            term_scores_vec[idx] = cval['fscore'].get(cterm, 0)
+            cval = res.get(cfeature, {score_type: {cterm: 0}})
+            term_scores_vec[idx] = cval[score_type].get(cterm, 0)
 
         if method == 'mean':        
             term_sample_scores = np.dot(cdata, term_scores_vec) / cdata.sum(axis=1)
@@ -3323,4 +3359,43 @@ def taxonomy_from_seqs_file(exp, filename='/Users/amnon/databases/sheba-seqs/she
         else:
             taxonomy.append('NA')
     exp.feature_metadata['Taxonomy']=taxonomy
+    return exp
+
+
+def standardize_nonzero(exp: ca.Experiment, axis=0, inplace=False) -> ca.Experiment:
+    '''Standardize a dataset along an axis using only the non-zero entries for each feature.
+
+    This transforms the data into unit mean and unit variance for the non-zero entries, 0 for the zero entries. It
+    calls :func:`sklearn.preprocessing.scale` to do the real work.
+
+    .. warning:: It will convert the ``Experiment.data`` from the sparse matrix to dense array.
+
+    Parameters
+    ----------
+    axis : 0, 1, 's', or 'f'
+        0 or 's'  means scaling occurs sample-wise; 1 or 'f' feature-wise.
+
+    Returns
+    -------
+    Experiment
+
+    '''
+    logger.debug('nonzero-scaling the data, axis=%d' % axis)
+    if not inplace:
+        exp = exp.copy()
+    if exp.sparse:
+        exp.sparse = False
+    data = exp.get_data(sparse=False,copy=True)
+    for i in range(data.shape[1]):
+        crow=data[:,i]
+        ipos = np.where(crow>0)[0]
+        ivec = crow[ipos]
+        if np.std(ivec)==0:
+            data[ipos,i] = ivec/np.sum(ivec)
+            continue
+        # normalize the vector to mean 1 std 1
+        ivec = (ivec-ivec.mean())/ivec.std()
+        ivec = ivec+2
+        data[ipos,i] = ivec
+    exp.data = data
     return exp
