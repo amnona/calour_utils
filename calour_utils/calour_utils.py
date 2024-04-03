@@ -2301,6 +2301,8 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
     if ok_columns is None:
         ok_columns = amd.columns
     for cfield in amd.columns:
+        if cfield=='seker_date.x':
+            pass
         if ok_columns is not None:
             if cfield not in ok_columns:
                 continue
@@ -2318,36 +2320,36 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
             num_skipped += 1
             continue
 
-        # if numeric and more than 2 unique values, do spearman correlation
-        if len(md[cfield].unique()) >= 3:
-            # do correlation if it is numeric. otherwise error
-            if not pd.to_numeric(md[cfield], errors='coerce').notnull().all():
-                num_skipped += 1
-                logger.debug('field %s is not numeric and contains >= 3 unique values. skipping' % cfield)
-                continue
-            # need at least 10 entries for correlation
-            if len(md[cfield]) < 10:
-                logger.debug('field %s contains <10 numeric entries. skipping' % cfield)
-                pass
-                # continue
-            cres = scipy.stats.spearmanr(md[value_field], md[cfield])
-            names.append('COR: (%d) %s: %s' % (len(md), cfield, cres))
-            bnames.append(cfield)
-            ccres = cres[0]
+        if len(md[cfield].unique()) == len(md[cfield]):
+            logger.debug('field %s contains all unique values. skipping' % cfield)
+            num_skipped += 1
+            continue
 
-        elif len(md[cfield].unique()) == 2:
-            # 2 values so lets do mann-whitney
-            vals = sorted(md[cfield].unique())
+        # if not numeric, do enrichment on the 2 most common values
+        if not pd.to_numeric(md[cfield], errors='coerce').notnull().all():
+            vals = md[cfield].value_counts()
+            # sort the values by count
+            vals = vals.sort_values(ascending=False)
+            # get the 2 most commomn values
+            valnames = vals.index[:2]
+            # if the count of the 2nd value is < 5 skip
+            if vals[valnames[1]] < 5:
+                logger.debug('field %s not enough samples for value %s (%d). skipping' % (cfield, valnames[1], vals[valnames[1]]))
+                num_skipped += 1
+                continue
+            vals = sorted(valnames)
             cv1 = md[md[cfield] == vals[0]]
             cv2 = md[md[cfield] == vals[1]]
-            cres = scipy.stats.mannwhitneyu(cv1[value_field], cv2[value_field], alternative='two-sided')
-            # also calculate the normalized (-1..1) difference
-            ranked_vals = scipy.stats.rankdata(md[value_field])
-
-            # normalize the effect size to be in the [-1:1] range (0 for random, -1 / 1 for fully ordered)
-            diff = np.median(ranked_vals[md[cfield]==vals[0]]) - np.median(ranked_vals[md[cfield]==vals[1]])
             n_g1 = len(cv1)
             n_g2 = len(cv2)
+            cres = scipy.stats.mannwhitneyu(cv1[value_field], cv2[value_field], alternative='two-sided')
+
+            # also calculate the normalized (-1..1) difference
+            ranked_vals = scipy.stats.rankdata(cv1+cv2)
+            rvals1 = ranked_vals[:n_g1]
+            rvals2 = ranked_vals[n_g2:]
+            # normalize the effect size to be in the [-1:1] range (0 for random, -1 / 1 for fully ordered)
+            diff = np.median(rvals1) - np.median(rvals2)
             diff = diff / ((((n_g1 + 1) / 2) + n_g2) - ((n_g2 + 1) / 2))
 
             bigger_name = vals[0] if diff > 0 else vals[1]
@@ -2359,10 +2361,20 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
             # ccres = np.median(cv1[value_field]) - np.median(cv2[value_field])
             ccres = diff
             bnames.append(cfield+':'+str(vals[0]))
+
+        # all numeric - do correlation
         else:
-            logger.debug('no values for field %s' % cfield)
-            num_skipped += 1
-            continue
+            # get the number of numeric entries (not None/Nan) in md[cfield]
+            num_numeric = pd.to_numeric(md[cfield], errors='coerce').notnull().sum()
+            # need at least 10 numeric entries for correlation
+            if num_numeric < 10:
+                logger.debug('field %s contains <10 numeric entries. skipping' % cfield)
+                continue
+            cres = scipy.stats.spearmanr(md[value_field], md[cfield])
+            names.append('COR: (%d) %s: %s' % (len(md), cfield, cres))
+            bnames.append(cfield)
+            ccres = cres[0]
+
         pvals.append(cres[1])
         fields.append(cfield)
         stats.append(ccres)
@@ -3307,6 +3319,16 @@ def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,meth
     for cfeature,cres in res.items():
         terms.update(cres[score_type].keys())
     logger.info('found %d terms' % len(terms))
+
+    seqs_per_term = 20
+    terms = defaultdict(int)
+    for cfeature,cres in res.items():
+        for cterm in cres[score_type].keys():
+            terms[cterm] += 1
+    # remove appearing in less than 10 sequences
+    terms = {k: v for k, v in terms.items() if v >= seqs_per_term}
+    terms = list(terms.keys())
+    logger.info('keeping %d terms present in >%d sequences' % (len(terms), seqs_per_term))
 
     terms = list(terms)
     term_data = np.zeros([len(exp.sample_metadata), len(terms)])
