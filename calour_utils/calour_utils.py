@@ -2301,8 +2301,6 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
     if ok_columns is None:
         ok_columns = amd.columns
     for cfield in amd.columns:
-        if cfield=='seker_date.x':
-            pass
         if ok_columns is not None:
             if cfield not in ok_columns:
                 continue
@@ -2342,10 +2340,12 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
             cv2 = md[md[cfield] == vals[1]]
             n_g1 = len(cv1)
             n_g2 = len(cv2)
-            cres = scipy.stats.mannwhitneyu(cv1[value_field], cv2[value_field], alternative='two-sided')
+            vals1 = cv1[value_field]
+            vals2 = cv2[value_field]
+            cres = scipy.stats.mannwhitneyu(vals1, vals2, alternative='two-sided')
 
             # also calculate the normalized (-1..1) difference
-            ranked_vals = scipy.stats.rankdata(cv1+cv2)
+            ranked_vals = scipy.stats.rankdata(list(vals1)+list(vals2))
             rvals1 = ranked_vals[:n_g1]
             rvals2 = ranked_vals[n_g2:]
             # normalize the effect size to be in the [-1:1] range (0 for random, -1 / 1 for fully ordered)
