@@ -2115,9 +2115,35 @@ def health_index(exp, method=None, bad_features=None, good_features=None, field_
         good_features = os.path.join(data_dir, 'nonspecific-down_feature.txt')
 
     ns_good = pd.read_csv(good_features, sep='\t', index_col=0)
+    if '_feature_id' not in ns_good.columns:
+        ns_good['_feature_id']=ns_good.index.values
     ns_good['dir'] = 'good'
     ns_bad = pd.read_csv(bad_features, sep='\t', index_col=0)
+    if '_feature_id' not in ns_bad.columns:
+        ns_bad['_feature_id']=ns_bad.index.values
     ns_bad['dir'] = 'bad'
+
+    # check if there are duplicates in ns_good and print a warning
+    if len(ns_good) != len(ns_good['_feature_id'].unique()):
+        logger.warning('found %d duplicates in good features. Removing the duplicates' % (len(ns_good) - len(ns_good['_feature_id'].unique())))
+        # remove duplicates from ns_good
+        ns_good = ns_good.drop_duplicates(subset='_feature_id')
+    # check if there are duplicates in ns_bad and print a warning
+    if len(ns_bad) != len(ns_bad['_feature_id'].unique()):
+        logger.warning('found %d duplicates in bad features. Removing the duplicates' % (len(ns_bad) - len(ns_bad['_feature_id'].unique())))
+        # remove duplicates from ns_bad
+        ns_bad = ns_bad.drop_duplicates(subset='_feature_id')
+
+    # check for duplicate features in ns_bad and ns_good
+    ids_good = set(ns_good['_feature_id'].values)
+    ids_bad = set(ns_bad['_feature_id'].values)
+    if len(ids_good.intersection(ids_bad)) > 0:
+        logger.warning('found %d features in both good and bad features. Ignoring them for the health index' % len(ids_good.intersection(ids_bad)))
+        ns_good = ns_good[~ns_good['_feature_id'].isin(ids_bad)]
+        ns_bad = ns_bad[~ns_bad['_feature_id'].isin(ids_good)]
+
+
+
     nsf = ns_good.merge(ns_bad, how='outer')
 
     print('%d good, %d bad' % (len(ns_good), len(ns_bad)))
@@ -2300,6 +2326,8 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
     num_skipped = 0
     if ok_columns is None:
         ok_columns = amd.columns
+        # drop the value_field from the list
+        ok_columns = ok_columns.drop(value_field)
     for cfield in amd.columns:
         if ok_columns is not None:
             if cfield not in ok_columns:
@@ -3057,7 +3085,7 @@ def cluster_and_enrichment(exp, num_test=10,seqs=None,cluster_iterations=10,alph
         ee=tt.copy()
         # ee=tt.sort_abundance()
         if 'Taxon' in ee.feature_metadata.columns:
-            print(ee.feature_metadata.Taxon[pos])
+            print(ee.feature_metadata.Taxon.iloc[pos])
         ss=ee.feature_metadata.index[pos]
         print(ss)
         func_res[ss]={}
@@ -3164,7 +3192,7 @@ def cluster_and_enrichment(exp, num_test=10,seqs=None,cluster_iterations=10,alph
         # now print positive correlation vs. all other sequences dbBact enrichment
         eee=tt.copy()
         eee.feature_metadata['_calour_direction']='not correlated'
-        eee.feature_metadata['_calour_stat']=-1
+        eee.feature_metadata['_calour_stat']=-1.0
         for x in ee.feature_metadata.index:
             if ee.feature_metadata.loc[x,'_calour_stat']>0:
                 eee.feature_metadata.loc[x,'_calour_direction']='correlated'
@@ -3421,3 +3449,114 @@ def standardize_nonzero(exp: ca.Experiment, axis=0, inplace=False) -> ca.Experim
         data[ipos,i] = ivec
     exp.data = data
     return exp
+
+
+
+def all_metadata_term_enrichment(exp,alpha=0.25, ok_columns=None, bad_values=[], printit=True, plotit=True):
+    '''Identify ASVs enriched in each metadata field and test for dbBact term enrichment for these ASVs
+    NOTE: no FDR correction for the multiple fields tested! only within each field
+    Parameters
+    ----------
+    exp: calour.AmpliconExperiment
+    alpha: float, optional
+        the FDR level for the asv detection test
+    ok_columns: list of str or None, optional
+        if not None, test only fields appeating in ok_columns instead of all the sample_metadata fields
+    bad_values: list of str, optional
+        values to not include in the testing (e.g. 'unknown')
+    printit: bool, optional
+        True to print the summary of the results (for the significant fields)
+    plotit: bool, optional
+        True to plot a barplot of the significant fields
+
+    Returns
+    -------
+    '''
+    exp=exp.copy()
+    amd = exp.sample_metadata.copy()
+    num_skipped = 0
+    if ok_columns is None:
+        ok_columns = amd.columns
+    for cfield in amd.columns:
+        if ok_columns is not None:
+            if cfield not in ok_columns:
+                continue
+        md = amd.copy()
+
+        # get rid of bad field values
+        for cignore in bad_values:
+            md = md[md[cfield] != cignore]
+
+        # skip fields with only 1 unique value
+        if len(md[cfield].unique()) == 1:
+            logger.debug('field %s contains 1 value. skipping' % cfield)
+            num_skipped += 1
+            continue
+
+        if len(md[cfield].unique()) == len(md[cfield]):
+            logger.debug('field %s contains all unique values. skipping' % cfield)
+            num_skipped += 1
+            continue
+
+        print('------------------')
+        print(cfield)
+
+        mvals = md[cfield]
+        # remove nan values
+        mvals = mvals[~pd.isna(mvals)]
+        # if len(mvals.unique()) >= 5:
+        #     if pd.to_numeric(md[cfield], errors='coerce').notnull().sum()<5:
+        #         logger.debug('field %s contains many values but not enough numeric values. skipping' % cfield)
+        #         num_skipped += 1
+        #         continue
+        #     # many values - coerce to numeric and do correlation
+        #     md[cfield] = pd.to_numeric(md[cfield], errors='coerce')
+        #     dd = exp.correlation(cfield, alpha=alpha)
+        #     if len(dd.feature_metadata) == 0:
+        #         logger.debug('field %s (COR): no significant ASVs detected' % cfield)
+        #         continue
+        #     print('field %s (COR): found %d significant ASVs' % (cfield, len(dd.feature_metadata)))
+
+        # if not numeric, do enrichment on the 2 most common values
+        if not pd.to_numeric(mvals, errors='coerce').notnull().all():
+            vals = md[cfield].value_counts()
+            # sort the values by count
+            vals = vals.sort_values(ascending=False)
+            if len(vals) < 2:
+                print('field %s: only 1 value detected. skipping' % cfield)
+                continue
+            # get the 2 most commomn values
+            valnames = vals.index[:2]
+            if len(valnames) < 2:
+                print('field %s (BIN): only 1 value name detected. skipping' % cfield)
+                continue
+            # if the count of the 2nd value is < 5 skip
+            if vals[valnames[1]] < 5:
+                logger.debug('field %s not enough samples for value %s (%d). skipping' % (cfield, valnames[1], vals[valnames[1]]))
+                num_skipped += 1
+                continue
+            exp.sample_metadata['_tmp']=exp.sample_metadata[cfield].astype(str)
+            vals = sorted(valnames)
+            dd = exp.diff_abundance('_tmp', str(vals[0]), str(vals[1]), alpha=alpha)
+            if len(dd.feature_metadata) == 0:
+                logger.debug('field %s (BIN): no significant ASVs detected' % cfield)
+                continue
+            print('field %s (BIN): found %d significant ASVs' % (cfield, len(dd.feature_metadata)))
+
+        # all numeric - do correlation
+        else:
+            dd = exp.correlation(cfield, alpha=alpha)
+            if len(dd.feature_metadata) == 0:
+                logger.debug('field %s (COR): no significant ASVs detected' % cfield)
+                continue
+            print('field %s (COR): found %d significant ASVs' % (cfield, len(dd.feature_metadata)))
+
+        if len(dd.feature_metadata['_calour_direction'].unique()) < 2:
+            logger.debug('field %s: only 1 direction detected. skipping' % cfield)
+            continue
+        res = dd.plot_diff_abundance_enrichment(ignore_exp=True)
+        plt.title(cfield)
+        print(res[1].feature_metadata)
+
+    if num_skipped > 0:
+        logger.info('skipped %d (out of %d) fields with inappropriate values' % (num_skipped, len(amd.columns)))
