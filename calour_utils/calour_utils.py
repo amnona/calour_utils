@@ -6,6 +6,7 @@ import os
 
 import numpy as np
 import scipy.stats
+import scipy
 from statsmodels.sandbox.stats.multicomp import multipletests
 import matplotlib.pyplot as plt
 import matplotlib.lines
@@ -208,7 +209,7 @@ def get_sign_pvals(exp, alpha=0.1, min_present=5):
         cdat = exp.data[:, idx]
         npos = np.sum(cdat > 0)
         nneg = np.sum(cdat < 0)
-        pvals.append(scipy.stats.binom_test(npos, npos + nneg))
+        pvals.append(scipy.stats.binomtest(npos, npos + nneg, alternative='greater')).pvalue
         esize.append((npos - nneg) / (npos + nneg))
     # plt.figure()
     # sp = np.sort(pvals)
@@ -427,6 +428,18 @@ def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecifi
         use_fields = exp.sample_metadata.columns
 
     for ccol in use_fields:
+        # if it is numeric - test for mean difference using mann-whitney. otherwise, check binary enrichment for each value
+        if np.issubdtype(exp.sample_metadata[ccol].dtype, np.number):
+            vals1 = exp1.sample_metadata[ccol]
+            vals2 = exp2.sample_metadata[ccol]
+            # remove Nan values
+            vals1 = vals1[~np.isnan(vals1)]
+            vals2 = vals2[~np.isnan(vals2)]
+            if len(vals1) >0 and len(vals2) > 0:
+                pv = scipy.stats.mannwhitneyu(vals1, vals2).pvalue
+                if pv < alpha:
+                    print('column %s is different (mann-whitney) between the groups. pval %f. median group1 %f (%f), group2 %f (%f)' % (ccol, pv, np.median(vals1), np.mean(vals1), np.median(vals2), np.mean(vals2)))
+                continue
         for cval in exp.sample_metadata[ccol].unique():
             if cval in ignore_vals:
                 continue
@@ -435,8 +448,8 @@ def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecifi
             if num1 + num2 < 20:
                 continue
             p0 = (num1 + num2) / tot_samples
-            pv1 = scipy.stats.binom_test(num1, s1, p0)
-            pv2 = scipy.stats.binom_test(num2, s2, p0)
+            pv1 = scipy.stats.binomtest(num1, s1, p0, alternative='greater').pvalue
+            pv2 = scipy.stats.binomtest(num2, s2, p0, alternative='greater').pvalue
             if (pv1 < alpha):
                 print('column %s value %s enriched in group1. p0=%f, num1=%f/%f (e:%f) num2=%f/%f (e:%f). pval %f' % (ccol, cval, p0, num1, s1, s1 * p0, num2, s2, s2 * p0, pv1))
             if (pv2 < alpha):
@@ -3560,3 +3573,75 @@ def all_metadata_term_enrichment(exp,alpha=0.25, ok_columns=None, bad_values=[],
 
     if num_skipped > 0:
         logger.info('skipped %d (out of %d) fields with inappropriate values' % (num_skipped, len(amd.columns)))
+
+
+def get_distance(exp: ca.Experiment,s1:str ,s2: str,method:str='logbc', copy:bool=True)->float:
+    '''Get the distance between 2 samples in an experiment
+    
+    Parameters
+    ----------
+    exp : Experiment
+        The experiment to calculate the distance in
+    s1 : str
+        The first sample id
+    s2 : str
+        The second sample id
+    method : str
+        The method to calculate the distance. options:
+        'logbc' : bray-curtis of the log of the frequencies
+        'bc' : bray-curtis of the frequencies
+        'bj' : jaccard of the binary frequencies
+    copy: bool
+        True to copy the data prior to calculation, False to modify the data in the experiment (if already copied - used for distance matrix calculation)
+    
+    Returns
+    -------
+    float
+        The distance between the 2 samples
+    '''
+    data = exp.get_data(sparse=False,copy=copy)
+    pos1 = exp.sample_metadata.index.get_loc(s1)
+    pos2 = exp.sample_metadata.index.get_loc(s2)
+    if method=='logbc':
+        data[data<1]=1
+        data = np.log2(data)
+    if method in ['logbc','bc']:
+        dist = scipy.spatial.distance.braycurtis(data[pos1,:],data[pos2,:])
+    elif method=='bj':
+        dist = scipy.spatial.distance.jaccard(data[pos1,:]>0,data[pos2,:]>0)
+    else:
+        raise ValueError('Unknown method %s' % method)
+    return dist
+
+
+def get_distances(exp: ca.Experiment, s1:str, method: str='logbc')->np.array:
+    '''Get the distance between a sample and all other samples of an experiment
+    
+    Parameters
+    ----------
+    exp : Experiment
+        The experiment to calculate the distance in
+    s1 : str
+        The first sample id
+    method : str
+        The method to calculate the distance. options:
+        'logbc' : bray-curtis of the log of the frequencies
+        'bc' : bray-curtis of the frequencies
+        'bj' : jaccard of the binary frequencies
+    
+    Returns
+    -------
+    np.array(float)
+        The distance between the 2 samples
+    '''
+    distances=np.zeros(len(exp.sample_metadata))
+    exp = exp.copy()
+    exp.sparse=False
+    if method=='logbc':
+        exp.data[exp.data<1]=1
+        exp.data = np.log2(exp.data)
+        method='bc'
+    for idx,cid in enumerate(exp.sample_metadata.index):
+        cdist = get_distance(exp,s1,cid,copy=False,method=method)
+        distances[idx]=cdist
+    return distances
