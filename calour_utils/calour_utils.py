@@ -2087,7 +2087,7 @@ def bicluster_analysis(exp, min_prevalence=0.2, include_subsets=True, num_iterat
     return cluster_exps
 
 
-def health_index(exp, method=None, bad_features=None, good_features=None, field_name='_health_index', use_features='both', return_filtered=False):
+def health_index(exp, method=None, bad_features=None, good_features=None, field_name='_health_index', use_features='both', return_filtered=False, region='v4'):
     '''Calcuulate the per-sample health index (from "Meta-analysis defines predominant shared microbial responses in various diseases and a specific inflammatory bowel disease signal", https://doi.org/10.1186/s13059-022-02637-7)
 
     Parameters
@@ -2115,6 +2115,11 @@ def health_index(exp, method=None, bad_features=None, good_features=None, field_
         'disease': use only bacteria lower in health
     return_filtered: bool, optional
         if True, return the experiment with only the health index features instead of all the features
+    region: str, optional
+        the region of the experiment. used if the bad_features and good_features are None to load the default health index bacteria. options:
+            'v4': V4 region
+            'v3': V3-V4 region
+ 
     Returns
     -------
     ca.AmpliconExperiment
@@ -2123,9 +2128,19 @@ def health_index(exp, method=None, bad_features=None, good_features=None, field_
     # load the non-specific bacteria
     data_dir = resource_filename(__package__, 'data')
     if bad_features is None:
-        bad_features = os.path.join(data_dir, 'nonspecific-up_feature.txt')
+        if region == 'v4':
+            bad_features = os.path.join(data_dir, 'nonspecific-up_feature.txt')
+        elif region == 'v3':
+            bad_features = os.path.join(data_dir, 'nonspecific-up_feature.v3.txt')
+        else:
+            raise ValueError('region %s not supported' % region)
     if good_features is None:
-        good_features = os.path.join(data_dir, 'nonspecific-down_feature.txt')
+        if region == 'v4':
+            good_features = os.path.join(data_dir, 'nonspecific-down_feature.txt')
+        elif region == 'v3':
+            good_features = os.path.join(data_dir, 'nonspecific-down_feature.v3.txt')
+        else:
+            raise ValueError('region %s not supported' % region)
 
     ns_good = pd.read_csv(good_features, sep='\t', index_col=0)
     if '_feature_id' not in ns_good.columns:
@@ -3284,8 +3299,99 @@ def cluster_sklearn(exp, method='kmeans', transform=[log_n, standardize], alpha=
     return exp,res
 
 
-def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,method='mean',score_type='fscore',threshold=None, low_number_correction=0):
-    '''Create a new experiment with same samples and f-scores as features by calculating the f-scores for each feature in the experiment
+def get_annotations_experiment(exp, transform=None,ignore_exp=True, max_id=None,method='mean',low_number_correction=0, focus_terms=None, force=False):
+    '''Create a new experiment with same samples and annotations as features by calculating the annotations score for each feature in the experiment
+    
+    Parameters
+    ----------
+    exp: calour.AmpliconExperiment
+        the experiment to plot
+    transform: str or None, optional
+        the transformation to apply to the data before calculating the f-scores.
+        Each ASV, the associated f-score is weighted by the transformed frequency of each ASV in the sample
+        options are:
+        None - no transformation
+        'percent' - convert to percent per sample (sum to 100%)
+        'binarydata' - convert the data to binary (presence/absence)
+        'rankdata' - convert the data to ranks "(within each sample)
+        'log2data' - convert the data to log2(x)
+    ignore_exp: bool, or list of int or None, optional
+        if True, ignore the current experiment
+        if None, don't ignore any experiment
+        if list of int, ignore the experiments with the given ids
+    max_id: int or list of int or None, optional
+        if int, the maximal annotationID to use for the f-scores analysis (for reproducible results ignoring new annotations)
+        if list of int, use only annotations within the list
+        if None, use all annotations
+    method: str, optional
+        the method to calculate the term-sample scores
+        'mean' - calculate the mean of the term scores
+        'median' - calculate the median of the term scores
+	low_number_correction: int, optional
+		the constant to penalize low number of annotations in the precision. used as precision=obs/(total+low_number_correction)
+    focus_terms: list of str or None, optional
+        if not None, use only annotations contatining all of the terms in the list (NOTE: can skew the f-score/recall calculation, but not the precision)
+    force: bool, optional
+        if True, force re-adding the annotations to the experiment
+
+    Returns
+    -------
+    calour.Experiment
+        the sample*term experiment with per-sample term f-scores as the data
+    '''
+    exp = exp.copy()
+
+    db = ca.database._get_database_class('dbbact')
+
+    # transform the reads count if needed
+    cdata = exp.get_data(sparse=False)
+    if transform is None:
+        pass
+    elif transform == 'percent':
+        cdata = cdata / cdata.sum(axis=1, keepdims=True) * 100
+    elif transform == 'binarydata':
+        cdata = (cdata > 0).astype(float)
+        cdata = cdata / cdata.sum(axis=1, keepdims=True)
+    elif transform == 'rankdata':
+        for ccol in range(cdata.shape[1]):
+            cdata[:, ccol] = scipy.stats.rankdata(cdata[:, ccol])
+        cdata = cdata / cdata.sum(axis=1, keepdims=True)
+    elif transform == 'log2data':
+        cdata[cdata<1] = 1
+        cdata = np.log2(cdata)
+        cdata = cdata / cdata.sum(axis=1, keepdims=True)
+    else:
+        raise ValueError('unknown transform %s' % transform)
+
+    # get the annotations
+    db.add_all_annotations_to_exp(exp, max_id=max_id, force=force)
+    # create the new experiment
+    annotations = exp.databases['dbbact']['annotations']
+    seq_annotations = exp.databases['dbbact']['sequence_annotations']
+    anno_data = np.zeros([len(exp.sample_metadata), len(annotations)])
+    # get all the annotations
+    anno={}
+    anno_desc=[]
+    for idx,canno in enumerate(annotations.values()):
+        cid = canno['id']
+        anno[cid]=idx
+        anno_desc.append('%s: %s' % (cid, db.db.get_annotation_string(canno)))
+
+    for idx,cseq in enumerate(exp.feature_metadata.index.values):
+        if cseq in seq_annotations:
+            for cannoid in seq_annotations[cseq]:
+                if cannoid not in anno:
+                    print('annotation %d not found in the annotations' % cannoid)
+                    continue
+                anno_data[:, anno[cannoid]] = anno_data[:, anno[cannoid]] + cdata[:, idx]
+    feature_df = pd.DataFrame(index=anno_desc)
+    feature_df['_feature_id'] = anno_desc
+
+    return ca.Experiment(data=anno_data, sample_metadata=exp.sample_metadata, feature_metadata=feature_df, sparse=False)
+
+
+def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,method='mean',score_type='fscore',threshold=None, low_number_correction=0, focus_terms=None, min_seqs_per_term=20, term_value_thresh=None):
+    '''Create a new experiment with same samples and terms as features by calculating the f-scores for each feature in the experiment
 
     Parameters
     ----------
@@ -3322,6 +3428,12 @@ def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,meth
         if not None, return only terms that are significantly enriched in the annotations compared to complete database null with p-val <= threshold
 	low_number_correction: int, optional
 		the constant to penalize low number of annotations in the precision. used as precision=obs/(total+low_number_correction)
+    focus_terms: list of str or None, optional
+        if not None, use only annotations contatining all of the terms in the list (NOTE: can skew the f-score/recall calculation, but not the precision)
+    min_seqs_per_term: int, optional
+        the minimal number of features containing the term to keep the term in the results
+    term_value_thresh: float or None, optional
+        if not None, return only terms with value (e.g. fscore/recall/precision) >= term_value_thresh in at least 1 feature
 
     Returns
     -------
@@ -3331,7 +3443,7 @@ def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,meth
     exp = exp.copy()
 
     db = ca.database._get_database_class('dbbact')
-    res=db.get_exp_feature_stats(exp, ignore_exp=ignore_exp, max_id=max_id, threshold=threshold, low_number_correction=low_number_correction)
+    res=db.get_exp_feature_stats(exp, ignore_exp=ignore_exp, max_id=max_id, threshold=threshold, low_number_correction=low_number_correction, focus_terms=focus_terms)
     # returns dict of {feature(str): {'fscore':, 'recall':, 'precision': , 'term_count':, 'reduced_f': }}
 
     # transform the reads count if needed
@@ -3355,33 +3467,36 @@ def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,meth
         raise ValueError('unknown transform %s' % transform)
 
     # create the new experiment
-    # create the terms list
-    terms = set()
-    for cfeature,cres in res.items():
-        terms.update(cres[score_type].keys())
-    logger.info('found %d terms' % len(terms))
 
-    seqs_per_term = 20
+    ## create the terms list
+
+    ### remove appearing in less than min_seqs_per_term sequences
+    all_features = set(exp.feature_metadata.index.values)
     terms = defaultdict(int)
+    term_max_val = defaultdict(float)
     for cfeature,cres in res.items():
-        for cterm in cres[score_type].keys():
+        if cfeature not in all_features:
+            logger.warn('feature %s not found in the experiment' % cfeature)
+            continue
+        for cterm,cscore in cres[score_type].items():
             terms[cterm] += 1
-    # remove appearing in less than 10 sequences
-    terms = {k: v for k, v in terms.items() if v >= seqs_per_term}
+            term_max_val[cterm] = max(term_max_val[cterm], cscore)
+    orig_num_terms = len(terms)
+    terms = {k: v for k, v in terms.items() if v >= min_seqs_per_term and term_max_val[k] >= term_value_thresh}
     terms = list(terms.keys())
-    logger.info('keeping %d terms present in >%d sequences' % (len(terms), seqs_per_term))
-
     terms = list(terms)
+    logger.info('keeping %d terms (out of %d total terms) present in >%d sequences' % (len(terms), orig_num_terms, min_seqs_per_term))
+
+    ## create the term-sample score matrix (each row is a sample, each column is a term)
     term_data = np.zeros([len(exp.sample_metadata), len(terms)])
 
-    # create the term-sample score matrix (each row is a sample, each column is a term)
     for term_idx, cterm in enumerate(terms):
         term_scores_vec = np.zeros([len(exp.feature_metadata)])
         for idx, cfeature in enumerate(exp.feature_metadata.index.values):
             cval = res.get(cfeature, {score_type: {cterm: 0}})
             term_scores_vec[idx] = cval[score_type].get(cterm, 0)
 
-        if method == 'mean':        
+        if method == 'mean': 
             term_sample_scores = np.dot(cdata, term_scores_vec) / cdata.sum(axis=1)
         elif method == 'median':
             raise ValueError('median method not implemented yet')
@@ -3390,7 +3505,7 @@ def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,meth
             raise ValueError('unknown method %s' % method)
         term_data[:,term_idx]=term_sample_scores
     
-    # create a dataframe with terms as the index and the 'feauture_id' column    
+    ## create a dataframe with terms as the index and the 'feauture_id' column for the feature_metadata of the new experiment
     df=pd.DataFrame(terms,columns=['feature_id'],index=terms)        
 
     new_exp = ca.Experiment(data=term_data, sample_metadata=exp.sample_metadata, feature_metadata=df, sparse=False,description='f-scores for %s' % exp.description)
