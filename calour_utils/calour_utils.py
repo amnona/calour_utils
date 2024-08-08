@@ -3390,7 +3390,7 @@ def get_annotations_experiment(exp, transform=None,ignore_exp=True, max_id=None,
     return ca.Experiment(data=anno_data, sample_metadata=exp.sample_metadata, feature_metadata=feature_df, sparse=False)
 
 
-def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,method='mean',score_type='fscore',threshold=None, low_number_correction=0, focus_terms=None, min_seqs_per_term=20, term_value_thresh=None):
+def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,method='mean',score_type='fscore',threshold=None, low_number_correction=0, focus_terms=None, min_seqs_per_term=20, term_value_thresh=0):
     '''Create a new experiment with same samples and terms as features by calculating the f-scores for each feature in the experiment
 
     Parameters
@@ -3432,7 +3432,7 @@ def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,meth
         if not None, use only annotations contatining all of the terms in the list (NOTE: can skew the f-score/recall calculation, but not the precision)
     min_seqs_per_term: int, optional
         the minimal number of features containing the term to keep the term in the results
-    term_value_thresh: float or None, optional
+    term_value_thresh: float, optional
         if not None, return only terms with value (e.g. fscore/recall/precision) >= term_value_thresh in at least 1 feature
 
     Returns
