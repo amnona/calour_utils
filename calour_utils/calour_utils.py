@@ -3760,3 +3760,64 @@ def get_distances(exp: ca.Experiment, s1:str, method: str='logbc')->np.array:
         cdist = get_distance(exp,s1,cid,copy=False,method=method)
         distances[idx]=cdist
     return distances
+
+def find_closest_samples(exp: ca.Experiment, s1:str, method: str='logbc'):
+    '''Find the closest samples to a given sample in an experiment
+
+    Parameters
+    ----------
+    exp : Experiment
+        The experiment to calculate the distance in
+    s1 : str
+        The first sample id
+    method : str
+        The method to calculate the distance. options:
+        'logbc' : bray-curtis of the log of the frequencies
+        'bc' : bray-curtis of the frequencies
+        'bj' : jaccard of the binary frequencies
+    
+    Returns
+    -------
+    exp: Experiment
+        The experiment with the samples sorted by distance to s1. Also we add the '_distance' field to the sample metadata
+    '''
+    distances = get_distances(exp,s1,method=method)
+    exp.sample_metadata['_distance']=distances
+    exp=exp.sort_by_metadata('_distance',axis='s')
+    return exp
+
+
+def compare_significant_direction(exp1,field, val1, val2, exp2, alpha=0.1, random_seed=None):
+    '''Compare the direction of the significant features in 2 experiments using binomial test
+    
+    Parameters
+    ----------
+    exp1 : calour.AmpliconExperiment
+        the first experiment to test (run the diff_abundance on)
+    field, val1, val2, alpha, random_seed : see diff_abundance()
+        parameters for the diff_abundance() function on exp1
+            
+    Returns
+    -------
+    '''
+    dd = exp1.diff_abundance(field, val1, val2, alpha=alpha, random_seed=random_seed)
+    print('found %d significant features in exp1' % len(dd.feature_metadata))
+    if len(dd.feature_metadata)==0:
+        return
+    exp2 = exp2.filter_ids(exp1.feature_metadata.index)
+    dd2 = exp2.diff_abundance(field, val1, val2, alpha=1)
+    num_ok = 0
+    num_bad = 0
+    for cfeature, crow in dd2.feature_metadata.iterrows():
+        if cfeature not in dd.feature_metadata.index:
+            print('strange error')
+            continue
+        if dd.feature_metadata.loc[cfeature,'_calour_direction'] == crow['_calour_direction']:
+            num_ok += 1
+        else:
+            num_bad += 1
+    print('num ok=%d, num bad=%d' % (num_ok, num_bad))
+    print('fraction good=%f' % (num_ok/(num_ok+num_bad)))
+    pval = scipy.stats.binomtest(num_ok, num_ok+num_bad)
+    print('pval=%f' % pval.pvalue)
+    return pval
