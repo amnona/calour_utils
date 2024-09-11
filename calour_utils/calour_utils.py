@@ -3787,32 +3787,30 @@ def find_closest_samples(exp: ca.Experiment, s1:str, method: str='logbc'):
     return exp
 
 
-def compare_significant_direction(exp1,field, val1, val2, exp2, alpha=0.1, random_seed=None):
+def compare_significant_direction(compare_file, exp, field, val1, val2=None, random_seed=None):
     '''Compare the direction of the significant features in 2 experiments using binomial test
     
     Parameters
     ----------
-    exp1 : calour.AmpliconExperiment
-        the first experiment to test (run the diff_abundance on)
-    field, val1, val2, alpha, random_seed : see diff_abundance()
-        parameters for the diff_abundance() function on exp1
-            
+    compare_file : str
+        name of the file containing the comparison experiment feature_metadata file (of the diff_abundance)
+    exp : calour.AmpliconExperiment
+        the experiment to test the directions in
+    field, val1, val2, random_seed: see AmpliconExperiment.diff_abundance()
+        the parameters for the diff_abundance test
+    
     Returns
     -------
     '''
-    dd = exp1.diff_abundance(field, val1, val2, alpha=alpha, random_seed=random_seed)
-    print('found %d significant features in exp1' % len(dd.feature_metadata))
-    if len(dd.feature_metadata)==0:
-        return
-    exp2 = exp2.filter_ids(exp1.feature_metadata.index)
-    dd2 = exp2.diff_abundance(field, val1, val2, alpha=1)
+    exp = exp.diff_abundance(field, val1, val2, alpha=1, random_seed=random_seed)
+    dd2 = pd.read_csv(compare_file, sep='\t', index_col=0)
+    print('loaded %d features' % len(dd2))
     num_ok = 0
     num_bad = 0
-    for cfeature, crow in dd2.feature_metadata.iterrows():
-        if cfeature not in dd.feature_metadata.index:
-            print('strange error')
+    for cfeature, crow in dd2.iterrows():
+        if cfeature not in exp.feature_metadata.index.values:
             continue
-        if dd.feature_metadata.loc[cfeature,'_calour_direction'] == crow['_calour_direction']:
+        if (exp.feature_metadata.loc[cfeature,'_calour_stat']<0) == (crow['_calour_stat']<0):
             num_ok += 1
         else:
             num_bad += 1
