@@ -2480,16 +2480,20 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
 
 # for the group_dependence method
 def variance_stat(data, labels):
-    cstat = 0.1
+    cstat = 0.001
     for clab in list(set(labels)):
+        if sum(labels == clab) < 2:
+            continue
         cdat = data[:, labels == clab]
-        ccstat = np.var(cdat, axis=1)
+        ccstat = np.nanvar(cdat, axis=1)
+        # replace nan with 0
+        ccstat[np.isnan(ccstat)] = 0
         cstat += ccstat
-    return np.var(data, axis=1) / cstat
+    return np.nanvar(data, axis=1) / cstat
 
 
 def group_dependece(exp: ca.Experiment, field, method='variance', transform=None,
-                    numperm=1000, alpha=0.1, fdr_method='dsfdr', random_seed=None, pair_field=None):
+                    numperm=1000, alpha=0.1, fdr_method='dsfdr', random_seed=None, pair_field=None,skip_filter=False):
     '''Find features with non-random group distribution based on within-group variance
 
     Used for example for identifying within-family conserved ASVs (in an experiment with many families)
@@ -2532,6 +2536,8 @@ def group_dependece(exp: ca.Experiment, field, method='variance', transform=None
     pair_field: str or None, optional
         if not None, this field is used for the random shuffle pairing. Labels are permuted only within samples sharing the same value of pair_field
         if None, permute labels of all samples
+    skip_filter: bool, optional
+        if True, do not filter out features with 0 abundance
 
     Returns
     -------
@@ -2550,7 +2556,10 @@ def group_dependece(exp: ca.Experiment, field, method='variance', transform=None
     if field not in exp.sample_metadata.columns:
         raise ValueError('Field %s not in sample_metadata. Possible fields are: %s' % (field, exp.sample_metadata.columns))
 
-    cexp = exp.filter_sum_abundance(0, strict=True)
+    if not skip_filter:
+        cexp = exp.filter_sum_abundance(0, strict=True)
+    else:
+        cexp = exp.copy()
 
     data = cexp.get_data(copy=True, sparse=False).transpose()
 
