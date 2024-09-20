@@ -2480,7 +2480,7 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
 
 # for the group_dependence method
 def variance_stat(data, labels):
-    cstat = 0.001
+    cstat = 0.00
     for clab in list(set(labels)):
         if sum(labels == clab) < 2:
             continue
@@ -2490,7 +2490,6 @@ def variance_stat(data, labels):
         ccstat[np.isnan(ccstat)] = 0
         cstat += ccstat
     return np.nanvar(data, axis=1) / cstat
-
 
 def group_dependece(exp: ca.Experiment, field, method='variance', transform=None,
                     numperm=1000, alpha=0.1, fdr_method='dsfdr', random_seed=None, pair_field=None,skip_filter=False):
@@ -2821,7 +2820,7 @@ def freq_to_metadata(exp, sequence, col_name='seq_freq'):
     '''
     data=exp.get_data(sparse=False,copy=True)
     cdat=data[:,exp.feature_metadata.index.get_loc(sequence)]
-    exp.sample_metadata['seq_freq'] = cdat
+    exp.sample_metadata[col_name] = cdat
     return exp
 
 
