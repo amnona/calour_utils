@@ -1364,38 +1364,58 @@ def paired_test(exp, pair_field, order_field, ):
     return exp, shuffle_pairs
 
 
-def plot_taxonomy(exp, field='taxonomy', num_show=10, show_legend=True, normalize=False):
+def plot_taxonomy(exp, level='genus', num_show=10, show_legend=True, normalize=100,sample_id_field=None):
     '''Plot a taxonomy bar plot (can also be used for terms)
-
+    
     Parameters
     ----------
-    exp: ca.Experiment
+    exp: calour.Experiment
     field: str, optional
         name of the feature field to use for the bars (i.e. 'taxonomy' or 'term')
     num_show: int, optional
         number of taxa to show
     show_legend: bool, optional
         True to plot the legend, False to not plot
+    normalize: float or None, optional
+        float to normalize the data before plotting to this sum per sample. None to skip normalization
+    sample_id_field: str, optional
+        name of the sample field to use for the x-axis labels (i.e. 'sample_id')
+
+    Returns
+    -------
+    f: matplotlib.figure
+        the figure with the plot
+    exp: calour.Experiment
+        the experiment with the taxonomy collapsed and sorted
     '''
     f = plt.figure()
-    if normalize:
-        exp = exp.normalize(axis='s')
+    if normalize is not None:
+        exp = exp.normalize(normalize,axis='s')
+    exp = exp.collapse_taxonomy(level=level)
     exp = exp.sort_abundance()
-    e1 = exp.reorder(np.arange(-1, -(num_show + 1), -1), axis='f')
-    exp = e1
-    term_num = []
-    terms = exp.feature_metadata.index.values
+    if len(exp.feature_metadata) > num_show:
+        exp.feature_metadata['keepid'] = np.arange(len(exp.feature_metadata),0,-1)
+        exp.feature_metadata[exp.feature_metadata['keepid'] >= num_show] = 'other'
+        exp = exp.aggregate_by_metadata('keepid', axis='f',agg='sum')
+
+    exp = exp.reorder(np.arange(len(exp.feature_metadata)-1,-1,-1), axis='f')
+    cbottom = np.zeros(len(exp.sample_metadata))
+    tax = []
     data = exp.get_data(sparse=False)
-    for cid in range(len(exp.feature_metadata)):
-        term_num.append(data[:, cid])
-    cbottom = np.zeros(len(term_num[0]))
-    for cid in range(len(term_num)):
-        ctn = term_num[cid]
-        plt.bar(np.arange(len(ctn)), ctn, bottom=cbottom)
+
+    for idx,ctax in enumerate(exp.feature_metadata['taxonomy'].values):
+        tax.append(ctax.split(';')[-1])
+        ctn = data[:,idx]
+        plt.bar(np.arange(len(exp.sample_metadata)), ctn, bottom=cbottom)
         cbottom += ctn
+
     if show_legend:
-        plt.legend(terms)
-    return f
+        plt.legend(tax)
+    
+    if sample_id_field is not None:
+        plt.xticks(np.arange(len(exp.sample_metadata)), exp.sample_metadata[sample_id_field].values, rotation='vertical')
+
+    return f, exp
 
 
 def cluster_by_terms(exp, min_score_threshold=0.1, filter_ratio=1.01):
@@ -2998,7 +3018,7 @@ def compare_diff_abundance_to_not_significant(exp,field,val1,val2=None,alpha=0.1
     return dd,dif,dif2
 
 
-def plot_term_fscores_per_bacteria(terms,exp,field,val1,val2=None,alpha=0.25):
+def plot_term_fscores_per_bacteria(terms,exp,field,val1,val2=None,alpha=0.25,term_type='fscore'):
     '''plot f-score distribution for bacteria associated with val1 and val2 in field or not associated with any of them
 
     Parameters
@@ -3015,6 +3035,9 @@ def plot_term_fscores_per_bacteria(terms,exp,field,val1,val2=None,alpha=0.25):
         the field value for group2
     alpha : float
         the FDR cutoff for significance (NOTE: we use FDR=0.5 for the non-significant features)
+    term_type : str
+        the type of term to test (default: 'fscore')
+        can be 'fscore' / 'recall' / 'precision'
     '''
     db=ca.database._get_database_class('dbbact')
 
@@ -3046,7 +3069,7 @@ def plot_term_fscores_per_bacteria(terms,exp,field,val1,val2=None,alpha=0.25):
     for term in terms:
         scores={}
         for cseq,cres in res.items():
-            cfscore=cres['fscore'].get(term,0)
+            cfscore=cres[term_type].get(term,0)
             scores[cseq]=cfscore
         v1exp=exp.filter_by_metadata('dd_type',[val1],axis='f')
         v2exp=exp.filter_by_metadata('dd_type',[val2],axis='f')

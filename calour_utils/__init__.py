@@ -1,2 +1,2 @@
 from .calour_utils import *
-__version__ = "2024.09.22"
+__version__ = "2024.12.17"
