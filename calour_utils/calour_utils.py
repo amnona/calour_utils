@@ -391,7 +391,7 @@ def sort_by_bacteria(exp, seq, inplace=True):
     return newexp
 
 
-def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecified', 'Unknown']), use_fields=None, alpha=0.05):
+def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecified', 'Unknown']), use_fields=None, alpha=0.05,min_cont=3):
     '''Test for metadata enrichment over all metadata fields between the two groups
 
     Parameters
@@ -408,25 +408,32 @@ def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecifi
     use_fields: list of str or None, optional
         list of fields to test for enrichment on None to test all
     alpha: float
-        the p-value cutoff
+        the BH-FDR q-value cutoff
+    min_cont: int, optional
+        minimal number of samples with non-NaN values in each group for the test to be performed
 
 
     Returns
     -------
-
+    fields (array of str) - the significant field/value results (string)
+    qvals (array of float) - the q-values for the significant field/value results
+    strings (array of str) - details about the significant field/value results (stats, p-vals)
     '''
     exp1 = exp.filter_samples(field, val1)
     if val2 is None:
         exp2 = exp.filter_samples(field, val1, negate=True)
     else:
         exp2 = exp.filter_samples(field, val2)
-    tot_samples = len(exp.sample_metadata)
+    tot_samples = len(exp1.sample_metadata)+len(exp2.sample_metadata)
     s1 = len(exp1.sample_metadata)
     s2 = len(exp2.sample_metadata)
 
     if use_fields is None:
         use_fields = exp.sample_metadata.columns
 
+    pvals = []
+    fields = []
+    strings = []
     for ccol in use_fields:
         # if it is numeric - test for mean difference using mann-whitney. otherwise, check binary enrichment for each value
         if np.issubdtype(exp.sample_metadata[ccol].dtype, np.number):
@@ -435,25 +442,38 @@ def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecifi
             # remove Nan values
             vals1 = vals1[~np.isnan(vals1)]
             vals2 = vals2[~np.isnan(vals2)]
-            if len(vals1) >0 and len(vals2) > 0:
+            if len(vals1) >= min_cont and len(vals2) >= min_cont:
                 pv = scipy.stats.mannwhitneyu(vals1, vals2).pvalue
-                if pv < alpha:
-                    print('column %s is different (mann-whitney) between the groups. pval %f. median group1 %f (%f), group2 %f (%f)' % (ccol, pv, np.median(vals1), np.mean(vals1), np.median(vals2), np.mean(vals2)))
+                pvals.append(pv)
+                fields.append(ccol)
+                # if pv < alpha:
+                strings.append('column %s is different (mann-whitney) between the groups. pval %f. median group1 %f (%f), group2 %f (%f)' % (ccol, pv, np.median(vals1), np.mean(vals1), np.median(vals2), np.mean(vals2)))
                 continue
+        # categorical, so test for enrichment of each value
         for cval in exp.sample_metadata[ccol].unique():
             if cval in ignore_vals:
                 continue
             num1 = np.sum(exp1.sample_metadata[ccol] == cval)
             num2 = np.sum(exp2.sample_metadata[ccol] == cval)
-            if num1 + num2 < 20:
+            if num1 + num2 < 2*min_cont:
                 continue
-            p0 = (num1 + num2) / tot_samples
-            pv1 = scipy.stats.binomtest(num1, s1, p0, alternative='greater').pvalue
-            pv2 = scipy.stats.binomtest(num2, s2, p0, alternative='greater').pvalue
-            if (pv1 < alpha):
-                print('column %s value %s enriched in group1. p0=%f, num1=%f/%f (e:%f) num2=%f/%f (e:%f). pval %f' % (ccol, cval, p0, num1, s1, s1 * p0, num2, s2, s2 * p0, pv1))
-            if (pv2 < alpha):
-                print('column %s value %s enriched in group2. p0=%f, num1=%f/%f (e:%f) num2=%f/%f (e:%f). pval %f' % (ccol, cval, p0, num1, s1, s1 * p0, num2, s2, s2 * p0, pv2))
+            # p0 = (num1 + num2) / tot_samples
+            # pv1 = scipy.stats.binomtest(num1, s1, p0, alternative='greater').pvalue
+            # pv2 = scipy.stats.binomtest(num2, s2, p0, alternative='greater').pvalue
+            pv = scipy.stats.fisher_exact([[num1,len(exp1.sample_metadata)-num1],[num2,len(exp2.sample_metadata)-num2]])[1]
+            # if (pv1 < alpha):
+                # strings.append('column %s value %s enriched in group1. p0=%f, num1=%f/%f (e:%f) num2=%f/%f (e:%f). pval %f' % (ccol, cval, p0, num1, s1, s1 * p0, num2, s2, s2 * p0, pv1))
+            # if (pv2 < alpha):
+                # strings.append('column %s value %s enriched in group2. p0=%f, num1=%f/%f (e:%f) num2=%f/%f (e:%f). pval %f' % (ccol, cval, p0, num1, s1, s1 * p0, num2, s2, s2 * p0, pv2))
+            pvals.append(pv)
+            strings.append('column %s value %s. num1=%f/%f (%f) num2=%f/%f (%f). pval %f' % (ccol, cval, num1, s1, num1/s1, num2, s2, num2/s2, pv))
+            fields.append(str(ccol) + '_' + str(cval))
+
+    res = multipletests(pvals, alpha=alpha, method='fdr_bh')
+    fields = np.array(fields)[res[0]]
+    strings = np.array(strings)[res[0]]
+    qvals = res[1][res[0]]
+    return fields,qvals, strings
 
 
 def filter_singletons(exp, field, min_number=2):
