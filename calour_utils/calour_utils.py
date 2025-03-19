@@ -24,25 +24,29 @@ from calour.transforming import log_n, standardize
 from calour.manipulation import chain
 
 try:
-    # get the logger config file location
-    log_file = resource_filename(__package__, 'log.cfg')
-    # log = path.join(path.dirname(path.abspath(__file__)), 'log.cfg')
-    # set the logger output according to log.cfg
-    # setting False allows other logger to print log.
-    fileConfig(log_file, disable_existing_loggers=False)
+    from loguru import logger
 except:
-    print('failed to load logging config file')
-    basicConfig(format='%(levelname)s:%(message)s')
+    print('loguru not found, using logging instead')
+    try:
+        # get the logger config file location
+        log_file = resource_filename(__package__, 'log.cfg')
+        # log = path.join(path.dirname(path.abspath(__file__)), 'log.cfg')
+        # set the logger output according to log.cfg
+        # setting False allows other logger to print log.
+        fileConfig(log_file, disable_existing_loggers=False)
+    except:
+        print('failed to load logging config file')
+        basicConfig(format='%(levelname)s:%(message)s')
 
-logger = getLogger(__package__)
-# set the log level to the same as calour module if present
-try:
-    clog = getLogger('calour')
-    calour_log_level = clog.getEffectiveLevel()
-    if calour_log_level != NOTSET:
-        logger.setLevel(calour_log_level)
-except:
-    print('calour module not found for log level setting. Level not set')
+    logger = getLogger(__package__)
+    # set the log level to the same as calour module if present
+    try:
+        clog = getLogger('calour')
+        calour_log_level = clog.getEffectiveLevel()
+        if calour_log_level != NOTSET:
+            logger.setLevel(calour_log_level)
+    except:
+        print('calour module not found for log level setting. Level not set')
 
 
 def equalize_groups(exp, group_field, equal_fields, random_seed=None):
@@ -391,7 +395,7 @@ def sort_by_bacteria(exp, seq, inplace=True):
     return newexp
 
 
-def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecified', 'Unknown']), use_fields=None, alpha=0.05,min_cont=3):
+def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecified', 'Unknown']), use_fields=None, alpha=0.05,min_cont=5,names=None, ignore_fields=[]):
     '''Test for metadata enrichment over all metadata fields between the two groups
 
     Parameters
@@ -411,6 +415,10 @@ def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecifi
         the BH-FDR q-value cutoff
     min_cont: int, optional
         minimal number of samples with non-NaN values in each group for the test to be performed
+    names: list of str or None, optional
+        list of names for the groups. if None, will use val1, val2
+    ignore_fields: list of str, optional
+        list of fields to ignore (improve power by reducing multiple testing)
 
 
     Returns
@@ -419,6 +427,11 @@ def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecifi
     qvals (array of float) - the q-values for the significant field/value results
     strings (array of str) - details about the significant field/value results (stats, p-vals)
     '''
+    if names is None:
+        if val2 is None:
+            names = [str(val1), 'not ' + str(val1)]
+        else:
+            names = [str(val1), str(val2)]
     exp1 = exp.filter_samples(field, val1)
     if val2 is None:
         exp2 = exp.filter_samples(field, val1, negate=True)
@@ -428,6 +441,11 @@ def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecifi
     s1 = len(exp1.sample_metadata)
     s2 = len(exp2.sample_metadata)
 
+    if s1 == 0:
+        raise ValueError('no samples with value %s in field %s' % (val1, field))
+    if s2 == 0:
+        raise ValueError('no samples with value %s in field %s' % (val2, field))
+
     if use_fields is None:
         use_fields = exp.sample_metadata.columns
 
@@ -435,38 +453,57 @@ def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecifi
     fields = []
     strings = []
     for ccol in use_fields:
+        if ccol in ignore_fields:
+            continue
         # if it is numeric - test for mean difference using mann-whitney. otherwise, check binary enrichment for each value
-        if np.issubdtype(exp.sample_metadata[ccol].dtype, np.number):
+        if np.issubdtype(exp.sample_metadata[ccol].dtype, np.number) and len(exp.sample_metadata[ccol].unique()) > 2:
             vals1 = exp1.sample_metadata[ccol]
             vals2 = exp2.sample_metadata[ccol]
             # remove Nan values
             vals1 = vals1[~np.isnan(vals1)]
             vals2 = vals2[~np.isnan(vals2)]
             if len(vals1) >= min_cont and len(vals2) >= min_cont:
-                pv = scipy.stats.mannwhitneyu(vals1, vals2).pvalue
+                res = scipy.stats.mannwhitneyu(vals1, vals2)
+                pv = res.pvalue
                 pvals.append(pv)
                 fields.append(ccol)
                 # if pv < alpha:
-                strings.append('column %s is different (mann-whitney) between the groups. pval %f. median group1 %f (%f), group2 %f (%f)' % (ccol, pv, np.median(vals1), np.mean(vals1), np.median(vals2), np.mean(vals2)))
+                if np.mean(vals1) > np.mean(vals2):
+                    strings.append('%s (%s) (MW) median %s %f (%f), %s %f (%f) pval=%f' % (ccol, names[0], names[0], np.median(vals1), np.mean(vals1), names[1], np.median(vals2), np.mean(vals2), pv))
+                else:
+                    strings.append('%s (%s) (MW) median %s %f (%f), %s %f (%f) pval=%f' % (ccol, names[1], names[0], np.median(vals1), np.mean(vals1), names[1], np.median(vals2), np.mean(vals2), pv))
                 continue
         # categorical, so test for enrichment of each value
         for cval in exp.sample_metadata[ccol].unique():
             if cval in ignore_vals:
                 continue
-            num1 = np.sum(exp1.sample_metadata[ccol] == cval)
-            num2 = np.sum(exp2.sample_metadata[ccol] == cval)
+            vals1 = exp1.sample_metadata[ccol].values
+            vals2 = exp2.sample_metadata[ccol].values
+            # remove Nan values
+            vals1 = vals1[~pd.isnull(vals1)]
+            vals2 = vals2[~pd.isnull(vals2)]
+
+            totnum1 = len(vals1)
+            totnum2 = len(vals2)
+
+            num1 = np.sum(vals1 == cval)
+            num2 = np.sum(vals2 == cval)
             if num1 + num2 < 2*min_cont:
                 continue
             # p0 = (num1 + num2) / tot_samples
             # pv1 = scipy.stats.binomtest(num1, s1, p0, alternative='greater').pvalue
             # pv2 = scipy.stats.binomtest(num2, s2, p0, alternative='greater').pvalue
-            pv = scipy.stats.fisher_exact([[num1,len(exp1.sample_metadata)-num1],[num2,len(exp2.sample_metadata)-num2]])[1]
+            res = scipy.stats.fisher_exact([[num1,totnum1-num1],[num2,totnum2-num2]])
+            pv = res[1]
             # if (pv1 < alpha):
                 # strings.append('column %s value %s enriched in group1. p0=%f, num1=%f/%f (e:%f) num2=%f/%f (e:%f). pval %f' % (ccol, cval, p0, num1, s1, s1 * p0, num2, s2, s2 * p0, pv1))
             # if (pv2 < alpha):
                 # strings.append('column %s value %s enriched in group2. p0=%f, num1=%f/%f (e:%f) num2=%f/%f (e:%f). pval %f' % (ccol, cval, p0, num1, s1, s1 * p0, num2, s2, s2 * p0, pv2))
             pvals.append(pv)
-            strings.append('column %s value %s. num1=%f/%f (%f) num2=%f/%f (%f). pval %f' % (ccol, cval, num1, s1, num1/s1, num2, s2, num2/s2, pv))
+            if num1/totnum1 > num2/totnum2:
+                strings.append('%s value %s enriched in %s. %s=%f/%f (%f) %s=%f/%f (%f). pval %f' % (ccol, cval, names[0], names[0], num1, totnum1, num1/totnum1, names[1], num2, totnum2, num2/totnum2, pv))
+            else:
+                strings.append('%s value %s enriched in %s. %s=%f/%f (%f) %s=%f/%f (%f). pval %f' % (ccol, cval, names[1], names[0], num1, totnum1, num1/totnum1, names[1], num2, totnum2, num2/totnum2, pv))
             fields.append(str(ccol) + '_' + str(cval))
 
     res = multipletests(pvals, alpha=alpha, method='fdr_bh')
@@ -2101,7 +2138,7 @@ def bicluster_analysis(exp, min_prevalence=0.2, include_subsets=True, num_iterat
             if num_unique == 1:
                 continue
 
-            # a lor of values - so look for correlation (if numeric)
+            # a lot of values - so look for correlation (if numeric)
             if num_unique > np.max([num_samples / 10, 3]):
                 try:
                     cdata = cexp.sample_metadata[cfield].astype(float)
@@ -2529,9 +2566,17 @@ def variance_stat(data, labels):
         # replace nan with 0
         ccstat[np.isnan(ccstat)] = 0
         cstat += ccstat
-    return np.nanvar(data, axis=1) / cstat
+        # if cdat[0][0]!=0:
+        #     print(cdat, clab, ccstat)
+    # if np.sum(cstat == 0)>0:
+    #     print('found %d features with 0 variance' % np.sum(cstat == 0))
+    #     print(clab)
+    # print(cstat, np.nanvar(data, axis=1)*data.shape[1])
 
-def group_dependece(exp: ca.Experiment, field, method='variance', transform=None,
+    # return cstat / (np.nanvar(data, axis=1)*data.shape[1])
+    return (np.nanvar(data, axis=1)*data.shape[1]) / cstat
+
+def group_dependence(exp: ca.Experiment, field, method='variance', transform=None,
                     numperm=1000, alpha=0.1, fdr_method='dsfdr', random_seed=None, pair_field=None,skip_filter=False):
     '''Find features with non-random group distribution based on within-group variance
 
@@ -2541,7 +2586,7 @@ def group_dependece(exp: ca.Experiment, field, method='variance', transform=None
     Parameters
     ----------
     field: str
-        The field to test by. Values are converted to numeric.
+        The field to test by. data is grouped by this field, so variance is tested within all samples with the same value in the field
     method : str or function
         the method to use for the statistic. options:
 
@@ -2551,18 +2596,17 @@ def group_dependece(exp: ca.Experiment, field, method='variance', transform=None
           numpy.array of sample metadata; output is a numpy.array of float)
     transform : str or None
         transformation to apply to the data before caluculating the statistic.
-
         * 'rankdata' : rank transfrom each OTU reads
         * 'log2data' : calculate log2 for each OTU using minimal cutoff of 2
         * 'normdata' : normalize the data to constant sum per samples
         * 'binarydata' : convert to binary absence/presence
+        * 'pair_rank' : rank transform each OTU reads within each pair field group
     alpha : float
         the desired FDR control level (type I error rate)
     numperm : int
         number of permutations to perform
     fdr_method : str
         method to compute FDR. Allowed methods include:
-
         * 'dsfdr': discrete FDR
         * 'bhfdr': Benjamini-Hochberg FDR method
         * 'byfdr' : Benjamini-Yekutielli FDR method
@@ -2581,7 +2625,7 @@ def group_dependece(exp: ca.Experiment, field, method='variance', transform=None
     Returns
     -------
     Experiment
-        The experiment with only correlated features, sorted according to correlation coefficient.
+        The experiment with only features that have the (within group variance)/(total variance) ratio significantly different compared to random permutations, sorted according to correlation coefficient.
 
         * '{}' : the non-adjusted p-values for each feature
         * '{}' : the FDR-adjusted q-values for each feature
@@ -2624,13 +2668,13 @@ def group_dependece(exp: ca.Experiment, field, method='variance', transform=None
         logger.info('Preparing paired permutation for field %s' % pair_field)
         # drop values with < 2 samples (across pair field)
         drop_values = []
-        for cval, cexp in exp.iterate(field):
-            if len(cexp.sample_metadata) < 2:
-                logger.debug('Value %s has only %d samples. dropped' % (cval, len(cexp.sample_metadata)))
-                drop_values.append(cval)
-        if len(drop_values) > 0:
-            logger.info('Dropping %d values with < 2 samples' % len(drop_values))
-            exp = exp.filter_samples(field, drop_values, negate=True)
+        # for cval, cexp in exp.iterate(field):
+        #     if len(cexp.sample_metadata) < 2:
+        #         logger.debug('Value %s has only %d samples. dropped' % (cval, len(cexp.sample_metadata)))
+        #         drop_values.append(cval)
+        # if len(drop_values) > 0:
+        #     logger.info('Dropping %d values with < 2 samples' % len(drop_values))
+        #     exp = exp.filter_samples(field, drop_values, negate=True)
 
         if len(exp.sample_metadata) == 0:
             raise ValueError('No samples with >1 value in pair field left')
@@ -2645,22 +2689,23 @@ def group_dependece(exp: ca.Experiment, field, method='variance', transform=None
             logger.debug('value %s has %d samples' % (cg, len(groups[cg])))
         if transform == 'pair_rank':
             # copy so we don't change the original experiment
-            exp = exp.copy()
-            # make all pairs to 0/1 (low/high) for each feature
-            exp.sparse = False
-            for cval in exp.sample_metadata[pair_field].unique():
-                cpos = np.where(exp.sample_metadata[pair_field] == cval)[0]
-                cdat = exp.data[cpos, :]
-                exp.data[cpos, :] = scipy.stats.rankdata(cdat, axis=0)
+            cexp = cexp.copy()
+            # rank data within each pair_field group
+            cexp.sparse = False
+            for cval in cexp.sample_metadata[pair_field].unique():
+                cpos = np.where(cexp.sample_metadata[pair_field] == cval)[0]
+                cdat = cexp.data[cpos, :]
+                cexp.data[cpos, :] = scipy.stats.rankdata(cdat, axis=0)
             # no need to do another transform in diff_abundance
             transform = None
+            data = cexp.get_data(copy=True, sparse=False).transpose()
 
         # create the numpy.random.Generator for the paired shuffler
         rng = np.random.default_rng(random_seed)
 
         def _pair_shuffler(labels, rng=rng, groups=groups):
             clabels = labels.copy()
-            for cgroup in groups.values():
+            for cname, cgroup in groups.items():
                 clabels[cgroup] = rng.permutation(clabels[cgroup])
             return clabels
 
@@ -2731,7 +2776,10 @@ def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation
     vals = []
     labels = []
     for clab, cexp in exp.iterate(group_field):
-        labels.append(clab)
+        if len(cexp.sample_metadata) < 2:
+            logger.info('Skipping group %s with <2 samples' % clab)
+            continue
+        labels.append(str(clab))
         vals.append(np.array(cexp.sample_metadata[value_field].values))
 
     if colors is not None:
@@ -3441,7 +3489,7 @@ def get_annotations_experiment(exp, transform=None,ignore_exp=True, max_id=None,
     return ca.Experiment(data=anno_data, sample_metadata=exp.sample_metadata, feature_metadata=feature_df, sparse=False)
 
 
-def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,method='mean',score_type='fscore',threshold=None, low_number_correction=0, focus_terms=None, min_seqs_per_term=20, term_value_thresh=0):
+def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,method='mean',score_type='fscore',threshold=None, low_number_correction=0, focus_terms=None, min_seqs_per_term=20, term_value_thresh=0,fscore_transform='none'):
     '''Create a new experiment with same samples and terms as features by calculating the f-scores for each feature in the experiment
 
     Parameters
@@ -3485,6 +3533,12 @@ def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,meth
         the minimal number of features containing the term to keep the term in the results
     term_value_thresh: float, optional
         if not None, return only terms with value (e.g. fscore/recall/precision) >= term_value_thresh in at least 1 feature
+    fscore_transform: str, optional
+        the transformation to apply to the f-scores before creating the new experiment (the transform is prior to multiplying the f-score by the feature frequency)
+        options are:
+        'none' - no transformation
+        'rankdata' - convert the f-scores to ranks (on all ASVs within each term)
+        'log2data' - convert the f-scores to log2(x)
 
     Returns
     -------
@@ -3546,6 +3600,18 @@ def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,meth
         for idx, cfeature in enumerate(exp.feature_metadata.index.values):
             cval = res.get(cfeature, {score_type: {cterm: 0}})
             term_scores_vec[idx] = cval[score_type].get(cterm, 0)
+
+        # transfrom the fscores
+        if fscore_transform == 'none':
+            pass
+        elif fscore_transform == 'rankdata':
+            term_scores_vec = scipy.stats.rankdata(term_scores_vec)
+        elif fscore_transform == 'log2data':
+            term_scores_vec = 10000 * term_scores_vec/np.sum(term_scores_vec)+1
+            term_scores_vec = np.log2(term_scores_vec)
+        else:
+            raise ValueError('unknown fscore_transform %s' % fscore_transform)
+
 
         if method == 'mean': 
             term_sample_scores = np.dot(cdata, term_scores_vec) / cdata.sum(axis=1)
@@ -3870,3 +3936,26 @@ def compare_significant_direction(compare_file, exp, field, val1, val2=None, ran
     pval = scipy.stats.binomtest(num_ok, num_ok+num_bad)
     print('pval=%f' % pval.pvalue)
     return pval
+
+
+def add_gg2_taxonomy(exp, taxonomy_file='/Users/amnon/databases/sheba-seqs/taxonomy_gg2_source_risk.tsv'):
+    '''Add the greengenes2 taxonomy to the experiment based on the local taxonomy file
+    
+    Parameters
+    ----------
+    exp : calour.AmpliconExperiment
+        the experiment to add the taxonomy to
+    taxonomy_file : str, optional
+        the path to the taxonomy file (tsv, first column is the sequence, Taxon column is the taxonomy)
+        
+    Returns
+    -------
+    calour.AmpliconExperiment
+        the experiment with the taxonomy added to the feature_metadata ('Taxonomy' column)
+    '''
+    newexp = exp.copy()
+    tf = pd.read_csv(taxonomy_file,sep='\t',index_col=0)
+    # add the 'Taxon' field to each row in the datc.feature_metadata table using the indices or '' if the index is not found in the tf table
+    newexp.feature_metadata['taxonomy'] = newexp.feature_metadata.index.map(lambda x: tf.loc[x]['Taxon'] if x in tf.index else '').astype(str)
+    return newexp
+
