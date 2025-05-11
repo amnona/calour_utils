@@ -2451,13 +2451,13 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
             num_skipped += 1
             continue
 
-        if len(md[cfield].unique()) == len(md[cfield]):
-            logger.debug('field %s contains all unique values. skipping' % cfield)
-            num_skipped += 1
-            continue
-
         # if not numeric, do enrichment on the 2 most common values
         if not pd.to_numeric(md[cfield], errors='coerce').notnull().all():
+            if len(md[cfield].unique()) == len(md[cfield]):
+                logger.debug('field %s contains all unique values. skipping' % cfield)
+                num_skipped += 1
+                continue
+
             vals = md[cfield].value_counts()
             # sort the values by count
             vals = vals.sort_values(ascending=False)
@@ -2578,7 +2578,7 @@ def variance_stat(data, labels):
 
 def group_dependence(exp: ca.Experiment, field, method='variance', transform=None,
                     numperm=1000, alpha=0.1, fdr_method='dsfdr', random_seed=None, pair_field=None,skip_filter=False):
-    '''Find features with non-random group distribution based on within-group variance
+    '''Find features with non-random group distribution based on within-group vs. between group variance
 
     Used for example for identifying within-family conserved ASVs (in an experiment with many families)
     The permutation based p-values and multiple hypothesis correction is implemented.
@@ -2901,14 +2901,22 @@ def freq_to_metadata(exp, sequence, col_name='seq_freq'):
     Parameters
     ----------
     exp: calour.AmpliconExperiment
-    sequence: str
-        The sequence to add to the sample_metadata
+    sequence: str or list of str
+        The sequence/sequences to add to the sample_metadata
+        if more than 1 sequence, the values are summed
     col_name: str, optional
         The name of the column to add to the sample_metadata (default: 'seq_freq')
     '''
+    if not isinstance(sequence, list):
+        sequence = [sequence]
     data=exp.get_data(sparse=False,copy=True)
-    cdat=data[:,exp.feature_metadata.index.get_loc(sequence)]
-    exp.sample_metadata[col_name] = cdat
+    freq_dat = np.zeros(data.shape[0])
+    for cseq in sequence:
+        if cseq not in exp.feature_metadata.index:
+            raise ValueError('Sequence %s not found in feature_metadata' % cseq)
+        cdat=data[:,exp.feature_metadata.index.get_loc(cseq)]
+        freq_dat += cdat
+    exp.sample_metadata[col_name] = freq_dat
     return exp
 
 
