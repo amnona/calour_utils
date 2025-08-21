@@ -49,6 +49,9 @@ except:
         print('calour module not found for log level setting. Level not set')
 
 
+def set_log_level(level):
+    logger.setLevel(level)
+
 def equalize_groups(exp, group_field, equal_fields, random_seed=None):
     '''Normalize an experiment so all groups have the same number of samples from each equal_field
 
@@ -213,7 +216,8 @@ def get_sign_pvals(exp, alpha=0.1, min_present=5):
         cdat = exp.data[:, idx]
         npos = np.sum(cdat > 0)
         nneg = np.sum(cdat < 0)
-        pvals.append(scipy.stats.binomtest(npos, npos + nneg, alternative='greater')).pvalue
+        # pvals.append(scipy.stats.binomtest(npos, npos + nneg, alternative='greater').pvalue)
+        pvals.append(scipy.stats.binomtest(npos, npos + nneg, alternative='two-sided').pvalue)
         esize.append((npos - nneg) / (npos + nneg))
     # plt.figure()
     # sp = np.sort(pvals)
@@ -2508,7 +2512,11 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
             bnames.append(cfield)
             ccres = cres[0]
 
-        pvals.append(cres[1])
+        if cres[1]>=0:
+            pvals.append(cres[1])
+        else:
+            logger.warning('pval None for field %s' % cfield)
+            pvals.append(1)
         fields.append(cfield)
         stats.append(ccres)
     if num_skipped > 0:
@@ -2534,10 +2542,11 @@ def metadata_correlation(exp, value_field, alpha=0.1, ok_columns=None, bad_value
         fields = fields[idx]
         bnames = bnames[idx]
         names = names[idx]
-        qpos = np.where((q < alpha) & (stats > 0))[0]
+        qpos = np.where((q <= alpha) & (stats > 0))[0]
+        qneg = np.where((q <= alpha) & (stats < 0))[0]
+        print('pos - %d, neg - %d' % (len(qpos), len(qneg)))
         if len(qpos)>10:
             qpos = qpos[-10:]
-        qneg = np.where((q < alpha) & (stats < 0))[0]
         if len(qneg)>10:
             qneg = qneg[:10]
         q_plot = np.hstack([q[qneg], q[qpos]])
@@ -3123,8 +3132,8 @@ def plot_term_fscores_per_bacteria(terms,exp,field,val1,val2=None,alpha=0.25,ter
         print('no significant features')
         return
     dd2=exp.diff_abundance(field,val1,val2,alpha=0.5)
-    print('*** found %d significant features' % len(dd.feature_metadata))
-    print('after prevalence filtering: %d features' % len(exp.feature_metadata))
+    logger.info('*** found %d significant features' % len(dd.feature_metadata))
+    logger.info('after prevalence filtering: %d features' % len(exp.feature_metadata))
     for cseq in exp.feature_metadata.index.values:
         if cseq not in dd2.feature_metadata.index.values:
             exp.feature_metadata.loc[cseq,'dd_type']='not_significant'
@@ -3572,6 +3581,11 @@ def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,meth
         for ccol in range(cdata.shape[1]):
             cdata[:, ccol] = scipy.stats.rankdata(cdata[:, ccol])
         cdata = cdata / cdata.sum(axis=1, keepdims=True)
+    elif transform == 'percentiledata':
+        for ccol in range(cdata.shape[1]):
+            cdata[:, ccol] = 100 * scipy.stats.rankdata(cdata[:, ccol]) / len(cdata[:, ccol])
+        cdata = cdata / cdata.sum(axis=1, keepdims=True)
+
     elif transform == 'log2data':
         cdata[cdata<1] = 1
         cdata = np.log2(cdata)
@@ -3614,6 +3628,8 @@ def get_fscores_experiment(exp, transform=None,ignore_exp=True, max_id=None,meth
             pass
         elif fscore_transform == 'rankdata':
             term_scores_vec = scipy.stats.rankdata(term_scores_vec)
+        elif fscore_transform == 'percentiledata':
+            term_scores_vec = 100 * scipy.stats.rankdata(term_scores_vec) / len(term_scores_vec)
         elif fscore_transform == 'log2data':
             term_scores_vec = 10000 * term_scores_vec/np.sum(term_scores_vec)+1
             term_scores_vec = np.log2(term_scores_vec)
