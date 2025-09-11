@@ -48,6 +48,13 @@ except:
     except:
         print('calour module not found for log level setting. Level not set')
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterator, *args, **kwargs):
+        return iterator
+    logger.info('tqdm not installed, progress bar will not be shown')
+
 
 def set_log_level(level):
     logger.setLevel(level)
@@ -456,7 +463,7 @@ def metadata_enrichment(exp, field, val1, val2=None, ignore_vals=set(['Unspecifi
     pvals = []
     fields = []
     strings = []
-    for ccol in use_fields:
+    for ccol in tqdm(use_fields, desc='Processing fields'):
         if ccol in ignore_fields:
             continue
         # if it is numeric - test for mean difference using mann-whitney. otherwise, check binary enrichment for each value
@@ -1172,7 +1179,7 @@ def trim_seqs(exp, new_len, pos='end'):
         new_seqs = [cseq[new_len:] for cseq in exp.feature_metadata.index.values]
     new_exp = exp.copy()
     new_exp.feature_metadata['new_seq'] = new_seqs
-    new_exp = new_exp.aggregate_by_metadata('new_seq', axis='f', agg='sum')
+    new_exp = new_exp.aggregate_by_metadata('new_seq', axis='f', agg='sum', add_agg_fields=False)
     # new_exp.feature_metadata = new_exp.feature_metadata.reindex(new_exp.feature_metadata['new_seq'])
     new_exp.feature_metadata = new_exp.feature_metadata.set_index('new_seq',drop=False)
     new_exp.feature_metadata['_feature_id'] = new_exp.feature_metadata['new_seq']
@@ -2819,6 +2826,10 @@ def plot_violin_category(exp, group_field, value_field, xlabel_params={'rotation
         plt.xlabel(group_field)
         plt.ylabel(value_field)
 
+    # plot the medians as lines of width 0.75
+    medians = [np.median(x) for x in vals]
+    plt.plot(np.arange(len(labels)) + 1, medians, 'k_', markersize=12, markeredgewidth=2) 
+
     for idx1, clab1 in enumerate(labels):
         for idx2, clab2 in enumerate(labels):
             if idx1 >= idx2:
@@ -3223,7 +3234,7 @@ def cluster_and_enrichment(exp, num_test=10,seqs=None,cluster_iterations=10,alph
         print('*** no sequences provided - selecting %d random sequences' % num_test)
         seqs=np.random.choice(tt.feature_metadata.index.values,num_test,replace=False)
 
-    for cseq in seqs:
+    for cseq in tqdm(seqs, desc='Iterating sequences'):
         print('---------------------------------------------------------')
         pos=tt.feature_metadata.index.get_loc(cseq)
         ee=tt.copy()
@@ -3746,7 +3757,7 @@ def all_metadata_term_enrichment(exp,alpha=0.25, ok_columns=None, bad_values=[],
     num_skipped = 0
     if ok_columns is None:
         ok_columns = amd.columns
-    for cfield in amd.columns:
+    for cfield in tqdm(amd.columns,desc='Processing fields'):
         if ok_columns is not None:
             if cfield not in ok_columns:
                 continue
