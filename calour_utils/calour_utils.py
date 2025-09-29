@@ -3,6 +3,7 @@ from logging import getLogger, NOTSET, basicConfig
 from pkg_resources import resource_filename
 from logging.config import fileConfig
 import os
+import sys
 
 import numpy as np
 import scipy.stats
@@ -25,6 +26,10 @@ from calour.manipulation import chain
 
 try:
     from loguru import logger
+    # change loguru to print to stdout instead of stderr, so it will be captured by jupyter
+    logger.remove(0)
+    # Add a new sink to redirect output to sys.stdout
+    logger.add(sys.stdout, enqueue=True)
 except:
     print('loguru not found, using logging instead')
     try:
@@ -49,6 +54,7 @@ except:
         print('calour module not found for log level setting. Level not set')
 
 try:
+    # optional dependency, for nicer progress bars
     from tqdm import tqdm
 except ImportError:
     def tqdm(iterator, *args, **kwargs):
@@ -2175,7 +2181,7 @@ def bicluster_analysis(exp, min_prevalence=0.2, include_subsets=True, num_iterat
     return cluster_exps
 
 
-def health_index(exp, method=None, bad_features=None, good_features=None, field_name='_health_index', use_features='both', return_filtered=False, region='v4'):
+def health_index(exp, method=None, bad_features=None, good_features=None, field_name='_health_index', use_features='both', return_filtered=False, region='v4',trim_length=None):
     '''Calcuulate the per-sample health index (from "Meta-analysis defines predominant shared microbial responses in various diseases and a specific inflammatory bowel disease signal", https://doi.org/10.1186/s13059-022-02637-7)
 
     Parameters
@@ -2231,10 +2237,16 @@ def health_index(exp, method=None, bad_features=None, good_features=None, field_
             raise ValueError('region %s not supported' % region)
 
     ns_good = pd.read_csv(good_features, sep='\t', index_col=0)
+    if trim_length is not None:
+        ns_good.index = ns_good.index.str.slice(0,trim_length)
+        ns_good['_feature_id']=ns_good.index.values
     if '_feature_id' not in ns_good.columns:
         ns_good['_feature_id']=ns_good.index.values
     ns_good['dir'] = 'good'
     ns_bad = pd.read_csv(bad_features, sep='\t', index_col=0)
+    if trim_length is not None:
+        ns_bad.index = ns_bad.index.str.slice(0,trim_length)
+        ns_bad['_feature_id']=ns_bad.index.values
     if '_feature_id' not in ns_bad.columns:
         ns_bad['_feature_id']=ns_bad.index.values
     ns_bad['dir'] = 'bad'
@@ -3114,7 +3126,7 @@ def compare_diff_abundance_to_not_significant(exp,field,val1,val2=None,alpha=0.1
     return dd,dif,dif2
 
 
-def plot_term_fscores_per_bacteria(terms,exp,field,val1,val2=None,alpha=0.25,term_type='fscore'):
+def plot_term_fscores_per_bacteria(terms,exp,field,val1=None,val2=None,alpha=0.25,term_type='fscore',annotation_types=None, detail_types=None, focus_terms=None, plotit=True):
     '''plot f-score distribution for bacteria associated with val1 and val2 in field or not associated with any of them
 
     Parameters
@@ -3123,8 +3135,9 @@ def plot_term_fscores_per_bacteria(terms,exp,field,val1,val2=None,alpha=0.25,ter
         the terms to test
     exp : AmpliconExperiment
         the experiment to test
-    field : str
+    field : str or None
         the field to test
+        if None, exp is assumed to be the result of a diff_abundance analysis (i.e. contains the "_calour_direction" column in feature_metadata)
     val1 : str
         the field value for group1
     val2 : str
@@ -3134,58 +3147,99 @@ def plot_term_fscores_per_bacteria(terms,exp,field,val1,val2=None,alpha=0.25,ter
     term_type : str
         the type of term to test (default: 'fscore')
         can be 'fscore' / 'recall' / 'precision'
+    annotation_types : str or None, optional
+        if not None, use only annotations of this type (e.g. 'diffexp', 'common', etc.)
+        (default: None, use all annotation types)
+    detail_types : str or None, optional
+        if not None, use only annotation terms with this type (i.e. 'high','low','all')
+        (default: None, use all detail types)
+    focus_terms : list of str or None, optional
+        if not None, use only annotations containing all of these terms
+        (default: None, use all annotations)
+    plotit : bool, optional
+        If True, plot the results (default: True)
+
+    Returns
+    -------
+    scores_per_term : dict of (term, {group1: list of float, group2: list of float, 'not_significant': list of float})
+        the scores for each term in the 3 groups
+    dd : calour.AmpliconExperiment
+        The differential abundance experiment (after prevalence filtering)
+    f : matplotlib.figure
+        The figure with the plots
     '''
     db=ca.database._get_database_class('dbbact')
 
     exp=exp.filter_prevalence(0.1)
-    dd=exp.diff_abundance(field,val1,val2,alpha=alpha)
-    if len(dd.feature_metadata)==0:
-        print('no significant features')
-        return
-    dd2=exp.diff_abundance(field,val1,val2,alpha=0.5)
-    logger.info('*** found %d significant features' % len(dd.feature_metadata))
     logger.info('after prevalence filtering: %d features' % len(exp.feature_metadata))
-    for cseq in exp.feature_metadata.index.values:
-        if cseq not in dd2.feature_metadata.index.values:
-            exp.feature_metadata.loc[cseq,'dd_type']='not_significant'
-        else:
-            exp.feature_metadata.loc[cseq,'dd_type']='na'
-    # set the 'type' field for datc.feature_metadata to be 'good' for all indices that have 'HT' tt.feature_metadata._calour_direction
+    if field is not None:
+        dd=exp.diff_abundance(field,val1,val2,alpha=alpha)
+        if len(dd.feature_metadata)==0:
+            print('no significant features')
+            return
+        dd2=exp.diff_abundance(field,val1,val2,alpha=0.5)
+    else:
+        dd=exp
+        if '_calour_direction' not in dd.feature_metadata.columns:
+            raise ValueError('field is None, so exp should contain the _calour_direction column in feature_metadata')
+        dd2=None
+
+    logger.info('*** found %d significant features' % len(dd.feature_metadata))
+    logger.info('number of significant features per group:', dd.feature_metadata['_calour_direction'].value_counts().to_dict())
+    group_vals = dd.feature_metadata['_calour_direction'].unique()
+    if dd2 is not None:
+        logger.info('*** found %d non-significant features' % (len(dd2.feature_metadata)-len(dd.feature_metadata)))
+        for cseq in exp.feature_metadata.index.values:
+            if cseq not in dd2.feature_metadata.index.values:
+                exp.feature_metadata.loc[cseq,'dd_type']='not_significant'
+            else:
+                exp.feature_metadata.loc[cseq,'dd_type']='na'
+    else:
+        logger.info('not using non-significant features')
+
     for cseq in dd.feature_metadata.index.values:
         if cseq not in exp.feature_metadata.index.values:
+            logger.info('STRANGE: sequence %s not in exp.feature_metadata' % cseq)
             continue
-        if dd.feature_metadata._calour_direction[cseq]==val1:
-            exp.feature_metadata.loc[cseq,'dd_type']=val1
-        else:
-            exp.feature_metadata.loc[cseq,'dd_type']=val2
+        exp.feature_metadata.at[cseq,'dd_type']=dd.feature_metadata._calour_direction[cseq]
+    res=db.get_exp_feature_stats(exp,annotation_types=annotation_types,detail_types=detail_types, focus_terms=focus_terms)
 
-    print(exp.feature_metadata.dd_type.value_counts())
-    res=db.get_exp_feature_stats(exp)
-
+    scores_per_term={}
     for term in terms:
         scores={}
         for cseq,cres in res.items():
             cfscore=cres[term_type].get(term,0)
             scores[cseq]=cfscore
-        v1exp=exp.filter_by_metadata('dd_type',[val1],axis='f')
-        v2exp=exp.filter_by_metadata('dd_type',[val2],axis='f')
-        notsigexp=exp.filter_by_metadata('dd_type',['not_significant'],axis='f')
+        v1exp=exp.filter_by_metadata('dd_type',group_vals[0],axis='f')
+        v2exp=exp.filter_by_metadata('dd_type',group_vals[1],axis='f')
+        notsigexp=exp.filter_by_metadata('dd_type','not_significant',axis='f')
 
         scoresv1=[scores.get(x,0) for x in v1exp.feature_metadata.index.values]
         scoresv2=[scores.get(x,0) for x in v2exp.feature_metadata.index.values]
         scoresnotsig=[scores.get(x,0) for x in notsigexp.feature_metadata.index.values]
+        if len(scoresnotsig)==0:
+            print('no non-significant features')
 
-        f=plt.figure()
-        plt.scatter(np.zeros(len(scoresv1)),scoresv1,c='g')
-        plt.scatter(np.ones(len(scoresv2)),scoresv2,c='r')
-        plt.scatter(np.ones(len(scoresnotsig))+1,scoresnotsig,c='k')
-        plt.violinplot([scoresv1, scoresv2,scoresnotsig],positions=[0,1,2],showmeans=True)
-        pv=scipy.stats.mannwhitneyu(scoresv1,scoresv2)
-        plt.title('%s: good=%f, bad=%f, pv: %f' % (term,np.median(scoresv1),np.median(scoresv2),pv[1]))
-        ax=plt.gca()
-        ax.set_xticks([0,1,2])
-        ax.set_xticklabels([val1,val2,'ns'],rotation=90)
+        if plotit:
+            f=plt.figure()
+            plt.scatter(np.zeros(len(scoresv1))+np.random.randn(len(scoresv1))*0.1,scoresv1,c='g')
+            plt.scatter(np.ones(len(scoresv2))+np.random.randn(len(scoresv2))*0.1,scoresv2,c='r')
+            plt.scatter(np.ones(len(scoresnotsig))+1+np.random.randn(len(scoresnotsig))*0.1,scoresnotsig,c='k')
+            if len(scoresnotsig)>0:
+                data = [scoresv1, scoresv2, scoresnotsig]
+            else:
+                data = [scoresv1, scoresv2]
 
+            plt.violinplot(data,positions=np.arange(len(data)),showmeans=False,showmedians=True)
+            pv=scipy.stats.mannwhitneyu(scoresv1,scoresv2)
+            plt.title('%s: good=%f, bad=%f, pv: %f' % (term,np.median(scoresv1),np.median(scoresv2),pv[1]))
+            ax=plt.gca()
+            ax.set_xticks([0,1,2])
+            ax.set_xticklabels([group_vals[0],group_vals[1],'ns'],rotation=90)
+
+        scores_per_term[term]={group_vals[0]:scoresv1,group_vals[1]:scoresv2,'not_significant':scoresnotsig}
+
+    return scores_per_term, dd
 
 def diff_abundance_enrichment(exp, **kwargs):
     # get the positive effect features
