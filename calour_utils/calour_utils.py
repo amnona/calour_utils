@@ -3126,6 +3126,52 @@ def compare_diff_abundance_to_not_significant(exp,field,val1,val2=None,alpha=0.1
     return dd,dif,dif2
 
 
+def get_fscores_posneg(exp, term, term_type='fscore', focus_terms=None):
+    '''Get the f-score distribution for bacteria associated with term in exp
+
+    Parameters
+    ----------
+    exp : AmpliconExperiment
+        the experiment to test
+    term : str
+        the term to test
+    term_type : str
+        the type of term to test (default: 'fscore')
+        can be 'fscore' / 'recall' / 'precision'
+    annotation_types : str or None, optional
+        if not None, use only annotations of this type (e.g. 'diffexp', 'common', etc.)
+        (default: None, use all annotation types)
+    detail_types : str or None, optional
+        if not None, use only annotation terms with this type (i.e. 'high','low','all')
+        (default: None, use all annotations)
+    focus_terms : list of str or None, optional
+        if not None, use only annotations containing all of these terms
+        (default: None, use all annotations)
+    plotit : bool, optional
+        If True, plot the results (default: True)
+    '''
+    db=ca.database._get_database_class('dbbact')
+    te=exp.copy()
+    res_pos=db.get_exp_feature_stats(te,detail_types=['high'], focus_terms=focus_terms)
+    te=exp.copy()
+    res_neg=db.get_exp_feature_stats(te,detail_types=['low'], focus_terms=focus_terms)
+    scores = []
+    for cseq in exp.feature_metadata.index:
+        if cseq not in res_pos:
+            tp = 0
+        else:
+            tp = res_pos[cseq]['fscore'].get(term,0)
+        if cseq not in res_neg:
+            tn = 0
+        else:
+            tn = res_neg[cseq]['fscore'].get('-'+term,0)
+        score = tp - tn
+        scores.append(score)
+    newexp = exp.copy()
+    newexp.feature_metadata['_' + term_type + '_' + term] = scores
+    return newexp
+
+
 def plot_term_fscores_per_bacteria(terms,exp,field,val1=None,val2=None,alpha=0.25,term_type='fscore',annotation_types=None, detail_types=None, focus_terms=None, plotit=True):
     '''plot f-score distribution for bacteria associated with val1 and val2 in field or not associated with any of them
 
