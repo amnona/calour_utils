@@ -1,26 +1,6 @@
-## Unreleased
+# calour_utils changelog
 
-### Refactor
-
-- update setup.py
-
-### Fix
-
-- testing
-
-## 0.3.0 (2021-07-27)
-
-### Fix
-
-- more print() to debug()
-- more print to debug()
-- update print to debug
-- testing commitizen
-
-### Feat
-
-- remove unneeded import
-
-### Refactor
-
-- set version to commitizen 1.1.1
+## 2025.12.04
+Bug fixes:
+* Update the variance_stat score (used in group_dependence) to 0-(within groups / total) instead of (total/within groups) to fix the divide by zero
+* Remove the skip_filter parameter from group_dependence, and instead use the exp.negatives parameter to skip filtering if True
