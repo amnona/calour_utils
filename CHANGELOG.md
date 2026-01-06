@@ -1,4 +1,7 @@
 # calour_utils changelog
+## 2026.01.07
+New features:
+* Add filter_ids_by_exp() - filter ids from another experiment and copy the metadata for each id from it
 
 ## 2025.12.04
 Bug fixes:

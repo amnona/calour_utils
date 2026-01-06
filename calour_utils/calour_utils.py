@@ -2604,8 +2604,8 @@ def variance_stat(data, labels):
     #     print(clab)
     # print(cstat, np.nanvar(data, axis=1)*data.shape[1])
 
-    return 0 - cstat / (np.nanvar(data, axis=1)*data.shape[1])
-    # return (np.nanvar(data, axis=1)*data.shape[1]) / cstat
+    # return 0 - cstat / (np.nanvar(data, axis=1)*data.shape[1])
+    return (np.nanvar(data, axis=1)*data.shape[1]) / (cstat+1E-8)
 
 def group_dependence(exp: ca.Experiment, field, method='variance', transform=None,
                     numperm=1000, alpha=0.1, fdr_method='dsfdr', random_seed=None, pair_field=None):
@@ -4096,3 +4096,38 @@ def add_gg2_taxonomy(exp, taxonomy_file='/Users/amnon/databases/sheba-seqs/taxon
     newexp.feature_metadata['taxonomy'] = newexp.feature_metadata.index.map(lambda x: tf.loc[x]['Taxon'] if x in tf.index else '').astype(str)
     return newexp
 
+
+def filter_ids_by_exp(exp, ids_exp, axis='f'):
+    '''filter the features/samples in exp so that only those appearing in ids_exp are kept. While copying the metadata from ids_exp
+    
+    Parameters
+    ----------
+    exp: ca.Experiment
+        the experiment to filter
+    ids_exp: ca.Experiment
+        the experiment containing the ids and metadata to keep
+    axis: str, optional
+        'f' to filter features, 's' to filter samples
+    
+    Returns
+    -------
+    ca.Experiment
+        the filtered experiment
+    '''
+    if axis=='f':
+        md = ids_exp.feature_metadata
+    elif axis=='s':
+        md = ids_exp.sample_metadata
+    else:
+        raise ValueError('unknown axis %s' % axis)
+    exp = exp.filter_ids(md.index, axis=axis)
+    if axis=='f':
+        nmd = exp.feature_metadata.copy()
+    else:
+        nmd = exp.sample_metadata.copy()
+    nmd = nmd.join(md, how='left', rsuffix='_joined')
+    if axis=='f':
+        exp.feature_metadata = nmd
+    else:
+        exp.sample_metadata = nmd
+    return exp
